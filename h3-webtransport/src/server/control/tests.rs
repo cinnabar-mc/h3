@@ -5,6 +5,7 @@ use std::{sync::Arc, task::Poll, time::Duration};
 use crate::SessionClose;
 
 mod fixture;
+mod observers;
 mod opening;
 mod pending_receive;
 mod trailers;

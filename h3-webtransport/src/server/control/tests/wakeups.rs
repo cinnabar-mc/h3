@@ -15,14 +15,14 @@ use super::fixture::Fixture;
 
 /// Counts one actual waiter's wakes and schedules only the enclosing finite test driver.
 #[derive(Default)]
-struct CountWake {
+pub(super) struct CountWake {
     count: AtomicUsize,
-    driver: AtomicWaker,
+    pub(super) driver: AtomicWaker,
 }
 
 impl CountWake {
     /// Reads the wake sequence without polling the waiter or its shared connection.
-    fn count(&self) -> usize {
+    pub(super) fn count(&self) -> usize {
         self.count.load(Ordering::SeqCst)
     }
 }
