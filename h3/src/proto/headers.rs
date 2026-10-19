@@ -59,6 +59,9 @@ impl Header {
     pub fn into_request_parts(
         self,
     ) -> Result<(Method, Uri, Option<Protocol>, HeaderMap), HeaderError> {
+        if self.pseudo.status.is_some() {
+            return Err(HeaderError::InvalidPseudoFieldContext);
+        }
         let mut uri = Uri::builder();
 
         if let Some(path) = self.pseudo.path {
@@ -105,16 +108,17 @@ impl Header {
     }
 
     pub fn into_response_parts(self) -> Result<(StatusCode, HeaderMap), HeaderError> {
+        let status = self.pseudo.status.ok_or(HeaderError::MissingStatus)?;
+        if self.pseudo.len != 1 {
+            return Err(HeaderError::InvalidPseudoFieldContext);
+        }
         //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.2
         //= type=implication
         //# For responses, a single ":status" pseudo-header field is defined that
         //# carries the HTTP status code; see Section 15 of [HTTP].  This pseudo-
         //# header field MUST be included in all responses; otherwise, the
         //# response is malformed (see Section 4.1.2).
-        Ok((
-            self.pseudo.status.ok_or(HeaderError::MissingStatus)?,
-            self.fields,
-        ))
+        Ok((status, self.fields))
     }
 
     pub fn into_fields(self) -> HeaderMap {
@@ -206,35 +210,41 @@ impl TryFrom<Vec<HeaderField>> for Header {
     fn try_from(headers: Vec<HeaderField>) -> Result<Self, Self::Error> {
         let mut fields = HeaderMap::with_capacity(headers.len());
         let mut pseudo = Pseudo::default();
+        let mut ordinary_seen = false;
 
         for field in headers.into_iter() {
             let (name, value) = field.into_inner();
-            match Field::parse(name, value)? {
+            let parsed = Field::parse(name, value)?;
+            if ordinary_seen && !matches!(parsed, Field::Header(_)) {
+                return Err(HeaderError::PseudoFieldAfterRegular);
+            }
+            match parsed {
                 Field::Method(m) => {
-                    pseudo.method = Some(m);
+                    insert_pseudo(&mut pseudo.method, m)?;
                     pseudo.len += 1;
                 }
                 Field::Scheme(s) => {
-                    pseudo.scheme = Some(s);
+                    insert_pseudo(&mut pseudo.scheme, s)?;
                     pseudo.len += 1;
                 }
                 Field::Authority(a) => {
-                    pseudo.authority = Some(a);
+                    insert_pseudo(&mut pseudo.authority, a)?;
                     pseudo.len += 1;
                 }
                 Field::Path(p) => {
-                    pseudo.path = Some(p);
+                    insert_pseudo(&mut pseudo.path, p)?;
                     pseudo.len += 1;
                 }
                 Field::Status(s) => {
-                    pseudo.status = Some(s);
+                    insert_pseudo(&mut pseudo.status, s)?;
                     pseudo.len += 1;
                 }
                 Field::Header((n, v)) => {
+                    ordinary_seen = true;
                     fields.append(n, v);
                 }
                 Field::Protocol(p) => {
-                    pseudo.protocol = Some(p);
+                    insert_pseudo(&mut pseudo.protocol, p)?;
                     pseudo.len += 1;
                 }
             }
@@ -242,6 +252,15 @@ impl TryFrom<Vec<HeaderField>> for Header {
 
         Ok(Header { pseudo, fields })
     }
+}
+
+/// Retains exactly one occurrence of each typed pseudo-field.
+fn insert_pseudo<T>(slot: &mut Option<T>, value: T) -> Result<(), HeaderError> {
+    if slot.is_some() {
+        return Err(HeaderError::DuplicatePseudoField);
+    }
+    *slot = Some(value);
+    Ok(())
 }
 
 enum Field {
@@ -438,6 +457,9 @@ pub enum HeaderError {
     MissingStatus,
     MissingAuthority,
     ContradictedAuthority,
+    DuplicatePseudoField,
+    PseudoFieldAfterRegular,
+    InvalidPseudoFieldContext,
 }
 
 impl HeaderError {
@@ -474,6 +496,13 @@ impl fmt::Display for HeaderError {
             HeaderError::MissingAuthority => write!(f, "missing authority"),
             HeaderError::ContradictedAuthority => {
                 write!(f, "uri and authority field are in contradiction")
+            }
+            HeaderError::DuplicatePseudoField => write!(f, "duplicate pseudo header field"),
+            HeaderError::PseudoFieldAfterRegular => {
+                write!(f, "pseudo header field follows a regular field")
+            }
+            HeaderError::InvalidPseudoFieldContext => {
+                write!(f, "pseudo header field is invalid in this message context")
             }
         }
     }
