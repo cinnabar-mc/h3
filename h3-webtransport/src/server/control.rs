@@ -14,6 +14,7 @@ const DATA_CHUNKS_PER_POLL: usize = 32;
 pub(super) struct ConnectControl<S, B> {
     pub(super) stream: RequestStream<S, B>,
     decoder: Capsules,
+    receiving_trailers: bool,
     terminal: Option<Closed>,
 }
 
@@ -23,6 +24,7 @@ impl<S, B> ConnectControl<S, B> {
         Self {
             stream,
             decoder: Capsules::default(),
+            receiving_trailers: false,
             terminal: None,
         }
     }
@@ -40,14 +42,26 @@ impl<S: quic::RecvStream, B: Buf> ConnectControl<S, B> {
             return Poll::Ready(terminal.clone());
         }
         for _ in 0..DATA_CHUNKS_PER_POLL {
-            let result = match self.stream.poll_recv_data(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(error)) => Err(error),
-                Poll::Ready(Ok(None)) => self.decoder.finish().map(|()| None),
-                Poll::Ready(Ok(Some(mut bytes))) => match self.decoder.receive(&mut bytes) {
-                    Ok(None) => continue,
-                    result => result,
-                },
+            let result = if self.receiving_trailers {
+                match self.stream.poll_recv_trailers(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(error)) => Err(error),
+                    Poll::Ready(Ok(_)) => self.decoder.finish().map(|()| None),
+                }
+            } else {
+                match self.stream.poll_recv_data(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(error)) => Err(error),
+                    Poll::Ready(Ok(None)) => {
+                        // The body may end at unvalidated HEADERS before the actual FIN.
+                        self.receiving_trailers = true;
+                        continue;
+                    }
+                    Poll::Ready(Ok(Some(mut bytes))) => match self.decoder.receive(&mut bytes) {
+                        Ok(None) => continue,
+                        result => result,
+                    },
+                }
             }
             .map_err(Arc::new);
             self.terminal = Some(result.clone());

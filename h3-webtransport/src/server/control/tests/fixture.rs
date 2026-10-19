@@ -5,7 +5,7 @@ use http::{Method, Request, StatusCode};
 use std::{sync::Arc, time::Duration};
 
 #[path = "../../../../../h3/src/tests/support.rs"]
-mod support;
+pub(super) mod support;
 
 use crate::server::WebTransportSession;
 
