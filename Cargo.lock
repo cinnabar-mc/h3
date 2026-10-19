@@ -423,7 +423,6 @@ dependencies = [
  "h3-datagram",
  "quinn",
  "tokio",
- "tokio-util",
  "tracing",
 ]
 
