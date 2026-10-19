@@ -6,6 +6,7 @@
 // concerned, but quic traits wouldn't match between the "h3" crate that
 // comes before h3_quinn and the one that comes after and runs the tests
 #[path = "../../../h3-quinn/src/lib.rs"]
+#[allow(unknown_lints, unexpected_cfgs)] // The included adapter owns its own feature set.
 mod h3_quinn;
 
 mod connection;
