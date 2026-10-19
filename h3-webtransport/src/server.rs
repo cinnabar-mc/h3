@@ -38,6 +38,8 @@ use crate::{capsule::encode_close, SessionClose};
 
 mod control;
 use control::ConnectControl;
+mod wake;
+use wake::{DriverWake, Role, Waiter};
 
 /// WebTransport session driver.
 ///
@@ -54,6 +56,7 @@ where
     session_id: SessionId,
     /// The underlying HTTP/3 connection
     server_conn: Mutex<Connection<C, B>>,
+    driver_wake: Arc<DriverWake>,
     connect_control: Mutex<ConnectControl<C::BidiStream, B>>,
     opener: Mutex<C::OpenStreams>,
     /// Shared State
@@ -184,6 +187,7 @@ where
             session_id,
             opener,
             server_conn: Mutex::new(conn),
+            driver_wake: Arc::default(),
             connect_control: Mutex::new(ConnectControl::new(stream)),
             shared,
         })
@@ -217,8 +221,10 @@ where
     /// Healthy progress stays pending; only a terminal connection failure completes this wait.
     /// A canceled borrowed wait retains partial input. Poll one maintenance driver, not
     /// competing maintenance waits; this neither accepts requests nor starts another reader.
+    /// It may run beside one pending uni accept and one pending bidi accept.
     pub async fn maintain(&self) -> Result<(), ConnectionError> {
-        poll_fn(|cx| self.server_conn.lock().unwrap().poll_control(cx)).await
+        let waiter = self.driver_wake.waiter(Role::Maintenance);
+        poll_fn(|cx| waiter.poll(cx, |cx| self.server_conn.lock().unwrap().poll_control(cx))).await
     }
 
     /// Sends one bounded close capsule and finishes the original CONNECT response direction.
@@ -240,6 +246,7 @@ where
         let Self {
             session_id,
             server_conn,
+            driver_wake,
             connect_control,
             opener,
             shared,
@@ -257,6 +264,7 @@ where
             session: Self {
                 session_id,
                 server_conn,
+                driver_wake,
                 connect_control: Mutex::new(control),
                 opener,
                 shared,
@@ -265,19 +273,29 @@ where
     }
 
     /// Accept an incoming unidirectional stream from the client, it reads the stream until EOF.
+    ///
+    /// Poll only one pending uni accept. Maintenance and one bidi accept may run concurrently.
     pub fn accept_uni(&self) -> AcceptUni<'_, C, B> {
         AcceptUni {
             conn: &self.server_conn,
+            waiter: self.driver_wake.waiter(Role::Uni),
         }
     }
 
     /// Accepts an incoming bidirectional stream or request
+    ///
+    /// Poll only one pending bidi accept. Maintenance and one uni accept may run concurrently.
     pub async fn accept_bi(&self) -> Result<Option<AcceptedBi<C, B>>, StreamError> {
-        let stream = poll_fn(|cx| {
-            let mut conn = self.server_conn.lock().unwrap();
-            conn.poll_accept_request_stream(cx)
-        })
-        .await;
+        let stream = {
+            let waiter = self.driver_wake.waiter(Role::Bi);
+            poll_fn(|cx| {
+                waiter.poll(cx, |cx| {
+                    let mut conn = self.server_conn.lock().unwrap();
+                    conn.poll_accept_request_stream(cx)
+                })
+            })
+            .await
+        };
 
         let stream = match stream {
             Ok(Some(s)) => FrameStream::new(BufRecvStream::new(s)),
@@ -502,6 +520,7 @@ where
     B: Buf,
 {
     conn: &'a Mutex<Connection<C, B>>,
+    waiter: Waiter<'a>,
 }
 
 impl<C, B> Future for AcceptUni<'_, C, B>
@@ -512,16 +531,18 @@ where
     type Output = Result<Option<(SessionId, RecvStream<C::RecvStream, B>)>, ConnectionError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut conn = self.conn.lock().unwrap();
-        conn.inner.poll_accept_recv(cx)?;
+        self.waiter.poll(cx, |cx| {
+            let mut conn = self.conn.lock().unwrap();
+            conn.inner.poll_accept_recv(cx)?;
 
-        // Get the currently available streams
-        let streams = conn.inner.accepted_streams_mut();
-        if let Some((id, stream)) = streams.wt_uni_streams.pop() {
-            return Poll::Ready(Ok(Some((id, RecvStream::new(stream)))));
-        }
+            // Get the currently available streams
+            let streams = conn.inner.accepted_streams_mut();
+            if let Some((id, stream)) = streams.wt_uni_streams.pop() {
+                return Poll::Ready(Ok(Some((id, RecvStream::new(stream)))));
+            }
 
-        Poll::Pending
+            Poll::Pending
+        })
     }
 }
 
