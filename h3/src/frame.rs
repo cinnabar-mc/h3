@@ -372,7 +372,7 @@ mod tests {
         let payload = Bytes::from_static(b"original");
         for limit in [None, Some(payload.len() as u64)] {
             let mut wire = BytesMut::new();
-            Frame::Headers(payload.clone()).encode_with_payload(&mut wire);
+            Frame::<Bytes>::Headers(payload.clone()).encode_with_payload(&mut wire);
             let mut input = BufList::from(wire);
             let mut decoder = FrameDecoder {
                 max_encoded_headers_size: limit,
@@ -415,7 +415,7 @@ mod tests {
         crate::qpack::encode_stateless(&mut encoded, vec![field]).unwrap();
         let limit = encoded.len() as u64;
         let mut wire = BytesMut::new();
-        Frame::Headers(encoded.freeze()).encode_with_payload(&mut wire);
+        Frame::<Bytes>::Headers(encoded.freeze()).encode_with_payload(&mut wire);
         let mut decoder = FrameDecoder {
             max_encoded_headers_size: Some(limit),
             ..Default::default()

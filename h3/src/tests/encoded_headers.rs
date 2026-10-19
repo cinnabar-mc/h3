@@ -5,7 +5,6 @@ use crate::{
     client,
     error::StreamError,
     proto::{
-        coding::Encode,
         frame::{Frame, FrameType},
         headers::Header,
         varint::VarInt,
