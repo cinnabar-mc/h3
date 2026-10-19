@@ -695,6 +695,71 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn body_end_finite_data_requires_its_declared_payload_before_fin() {
+        let mut observed = Vec::new();
+        for payload in [&b""[..], &b"bo"[..]] {
+            let mut wire = BytesMut::new();
+            FrameType::DATA.encode(&mut wire);
+            VarInt::from(4u32).encode(&mut wire);
+            wire.extend_from_slice(payload);
+            let mut recv = FakeRecv::default();
+            recv.chunk(wire.freeze());
+            let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
+            assert_poll_matches!(
+                |cx| stream.poll_next(cx),
+                Ok(Some(Frame::Data(PayloadLen(4))))
+            );
+            // Consume any delivered prefix before asking the same owner to observe actual FIN.
+            let mut terminal = poll_fn(|cx| to_bytes(stream.poll_data(cx))).await;
+            while matches!(terminal, Ok(Some(_))) {
+                terminal = poll_fn(|cx| to_bytes(stream.poll_data(cx))).await;
+            }
+            observed.push((payload.len(), terminal));
+        }
+        for (prefix, terminal) in observed {
+            assert!(
+                matches!(terminal, Err(FrameStreamError::UnexpectedEnd)),
+                "finite DATA accepted FIN after {prefix} of 4 bytes: {terminal:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn body_end_unbounded_webtransport_preserves_empty_buffered_and_split_fin() {
+        let mut observed = Vec::new();
+        for chunks in [vec![], vec![&b"body"[..]], vec![&b"bo"[..], &b"dy"[..]]] {
+            let id = crate::webtransport::SessionId::try_from(0).unwrap();
+            let mut header = BytesMut::new();
+            Frame::<Bytes>::WebTransportStream(id).encode_with_payload(&mut header);
+            let mut recv = FakeRecv::default();
+            if let Some(first) = chunks.first() {
+                header.extend_from_slice(first);
+            }
+            recv.chunk(header.freeze());
+            for chunk in chunks.into_iter().skip(1) {
+                recv.chunk(Bytes::copy_from_slice(chunk));
+            }
+            let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
+            assert_poll_matches!(
+                |cx| stream.poll_next(cx),
+                Ok(Some(Frame::WebTransportStream(actual))) if actual == id
+            );
+            let mut body = BytesMut::new();
+            let terminal = loop {
+                match poll_fn(|cx| to_bytes(stream.poll_data(cx))).await {
+                    Ok(Some(bytes)) => body.extend_from_slice(&bytes),
+                    terminal => break terminal,
+                }
+            };
+            observed.push((body.freeze(), terminal));
+        }
+        for ((body, terminal), expected) in observed.into_iter().zip([&b""[..], b"body", b"body"]) {
+            assert_matches!(terminal, Ok(None));
+            assert_eq!(body.as_ref(), expected);
+        }
+    }
+
     // Helpers
 
     #[derive(Default)]

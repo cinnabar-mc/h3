@@ -9,6 +9,7 @@
 #[allow(unknown_lints, unexpected_cfgs)] // The included adapter owns its own feature set.
 mod h3_quinn;
 
+mod body_end;
 mod connection;
 mod encoded_headers;
 mod header_validation;

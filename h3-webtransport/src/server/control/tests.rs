@@ -4,6 +4,7 @@ use std::{sync::Arc, task::Poll, time::Duration};
 
 use crate::SessionClose;
 
+mod empty_data;
 mod fixture;
 mod observers;
 mod opening;
