@@ -63,6 +63,14 @@ impl Pair {
     }
 
     pub async fn client_inner(&self) -> quinn::Connection {
+        self.client_inner_with_transport(None).await
+    }
+
+    /// Applies an optional real peer transport limit without changing the original default pair.
+    pub async fn client_inner_with_transport(
+        &self,
+        transport: Option<Arc<TransportConfig>>,
+    ) -> quinn::Connection {
         let addr = (Ipv6Addr::LOCALHOST, self.port)
             .to_socket_addrs()
             .unwrap()
@@ -81,9 +89,12 @@ impl Pair {
         crypto.enable_early_data = true;
         crypto.alpn_protocols = vec![b"h3".to_vec()];
 
-        let client_config = h3_quinn::quinn::ClientConfig::new(Arc::new(
+        let mut client_config = h3_quinn::quinn::ClientConfig::new(Arc::new(
             QuicClientConfig::try_from(crypto).unwrap(),
         ));
+        if let Some(transport) = transport {
+            client_config.transport_config(transport);
+        }
 
         let mut client_endpoint =
             h3_quinn::quinn::Endpoint::client("[::]:0".parse().unwrap()).unwrap();

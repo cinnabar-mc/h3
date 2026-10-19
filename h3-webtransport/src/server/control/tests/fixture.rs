@@ -2,7 +2,7 @@ use bytes::Bytes;
 use h3::ext::Protocol;
 use h3_quinn as quic_backend;
 use http::{Method, Request, StatusCode};
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 #[path = "../../../../../h3/src/tests/support.rs"]
 mod support;
@@ -25,11 +25,26 @@ pub(super) struct Fixture {
 impl Fixture {
     /// Establishes only through actual peer settings, TLS, HTTP3 and the public WT accept owner.
     pub async fn new() -> Self {
+        Self::with_client_transport(None).await
+    }
+
+    /// Advertises actual QUIC stream credit so the original opener must retain a partial prefix.
+    pub async fn with_receive_window(window: u32) -> Self {
+        let mut transport = quinn::TransportConfig::default();
+        transport.stream_receive_window(window.into());
+        Self::with_client_transport(Some(Arc::new(transport))).await
+    }
+
+    /// Builds the same real CONNECT session with only the selected peer transport configuration.
+    async fn with_client_transport(transport: Option<Arc<quinn::TransportConfig>>) -> Self {
         let mut pair = support::Pair::default();
         pair.with_timeout(Duration::from_secs(10));
         let endpoint = pair.server_inner();
         let client = async {
-            let peer = pair.client_inner().await;
+            let peer = match transport {
+                Some(transport) => pair.client_inner_with_transport(Some(transport)).await,
+                None => pair.client_inner().await,
+            };
             let (mut driver, mut sender) = h3::client::builder()
                 .enable_datagram(true)
                 .enable_extended_connect(true)
