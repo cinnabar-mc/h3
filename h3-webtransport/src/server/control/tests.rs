@@ -6,6 +6,7 @@ use crate::SessionClose;
 
 mod fixture;
 mod opening;
+mod pending_receive;
 mod trailers;
 use fixture::Fixture;
 
