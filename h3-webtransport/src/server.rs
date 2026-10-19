@@ -485,6 +485,7 @@ where
 /// An accepted incoming bidirectional stream.
 ///
 /// Since
+#[allow(clippy::large_enum_variant)] // Preserve the public inline stream variants.
 pub enum AcceptedBi<C: quic::Connection<B>, B: Buf> {
     /// An incoming bidirectional stream
     BidiStream(SessionId, BidiStream<C::BidiStream, B>),
