@@ -9,6 +9,7 @@
 mod h3_quinn;
 
 mod connection;
+mod header_validation;
 mod request;
 
 use std::{
