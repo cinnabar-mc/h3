@@ -268,7 +268,6 @@ pub(super) struct AcceptRecvStream<S, B> {
     ty: Option<StreamType>,
     /// push_id or session_id
     id: Option<VarInt>,
-    expected: Option<usize>,
 }
 
 impl<S, B> AcceptRecvStream<S, B>
@@ -281,7 +280,6 @@ where
             stream: BufRecvStream::new(stream),
             ty: None,
             id: None,
-            expected: None,
         }
     }
 
@@ -299,68 +297,46 @@ where
         }
     }
 
-    // helper function to poll the next VarInt from self.stream
-    fn poll_next_varint(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(VarInt, Option<StreamEnd>), PollTypeError>> {
-        // Flag if the stream was reset or finished by the peer
-        let mut stream_stopped = None;
-
+    /// Consumes a complete buffered varint, retaining partial input across pending reads.
+    fn poll_next_varint(&mut self, cx: &mut Context<'_>) -> Poll<Result<VarInt, PollTypeError>> {
         loop {
-            if stream_stopped.is_some() {
-                return Poll::Ready(Err(PollTypeError::EndOfStream));
+            let buf = self.stream.buf_mut();
+            if buf.has_remaining() && buf.remaining() >= VarInt::encoded_size(buf.chunk()[0]) {
+                return Poll::Ready(VarInt::decode(buf).map_err(|_| {
+                    PollTypeError::InternalError(InternalConnectionError::new(
+                        Code::H3_INTERNAL_ERROR,
+                        "Unexpected end parsing varint".to_string(),
+                    ))
+                }));
             }
+
             //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2
             //# A receiver MUST tolerate unidirectional streams being
             //# closed or reset prior to the reception of the unidirectional stream
             //# header.
-            stream_stopped = match ready!(self.stream.poll_read(cx)) {
-                Ok(false) => None,
-                Ok(true) => Some(StreamEnd::EndOfStream),
+            match ready!(self.stream.poll_read(cx)) {
+                Ok(false) => (),
+                Ok(true) => return Poll::Ready(Err(PollTypeError::EndOfStream)),
                 Err(StreamErrorIncoming::ConnectionErrorIncoming { connection_error }) => {
                     return Poll::Ready(Err(PollTypeError::IncomingError(connection_error)));
                 }
-                Err(StreamErrorIncoming::StreamTerminated { .. }) => Some(StreamEnd::Reset),
+                Err(StreamErrorIncoming::StreamTerminated { .. }) => {
+                    return Poll::Ready(Err(PollTypeError::EndOfStream));
+                }
                 Err(StreamErrorIncoming::Unknown(_err)) => {
                     #[cfg(feature = "tracing")]
                     tracing::error!("Unknown error when reading stream {}", _err);
 
-                    Some(StreamEnd::Other)
+                    return Poll::Ready(Err(PollTypeError::EndOfStream));
                 }
-            };
-
-            let mut buf = self.stream.buf_mut();
-            if self.expected.is_none() && buf.remaining() >= 1 {
-                self.expected = Some(VarInt::encoded_size(buf.chunk()[0]));
             }
-
-            if let Some(expected) = self.expected {
-                if buf.remaining() < expected {
-                    continue;
-                }
-            } else {
-                continue;
-            }
-
-            let reult = VarInt::decode(&mut buf).map_err(|_| {
-                PollTypeError::InternalError(InternalConnectionError::new(
-                    Code::H3_INTERNAL_ERROR,
-                    "Unexpected end parsing varint".to_string(),
-                ))
-            })?;
-
-            return Poll::Ready(Ok((reult, stream_stopped)));
         }
     }
 
     pub fn poll_type(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), PollTypeError>> {
         // If we haven't parsed the stream type yet
         if self.ty.is_none() {
-            // TODO create a test for the StreamEnd Option
-            // If the stream ended or reset directly after the type was received
-            // can we poll data again?
-            let (var, _) = ready!(self.poll_next_varint(cx))?;
+            let var = ready!(self.poll_next_varint(cx))?;
             let ty = StreamType::from_value(var.0);
             self.ty = Some(ty);
         }
@@ -371,19 +347,12 @@ where
             Some(StreamType::PUSH | StreamType::WEBTRANSPORT_UNI)
         ) && self.id.is_none()
         {
-            let (var, _) = ready!(self.poll_next_varint(cx))?;
+            let var = ready!(self.poll_next_varint(cx))?;
             self.id = Some(var);
         }
 
         Poll::Ready(Ok(()))
     }
-}
-
-enum StreamEnd {
-    EndOfStream,
-    Reset,
-    // if the quic layer returns an unknown error
-    Other,
 }
 
 pub(super) enum PollTypeError {
