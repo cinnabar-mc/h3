@@ -265,7 +265,7 @@ where
     }
 
     /// Accept an incoming unidirectional stream from the client, it reads the stream until EOF.
-    pub fn accept_uni(&self) -> AcceptUni<C, B> {
+    pub fn accept_uni(&self) -> AcceptUni<'_, C, B> {
         AcceptUni {
             conn: &self.server_conn,
         }
@@ -313,7 +313,7 @@ where
     }
 
     /// Open a new bidirectional stream
-    pub fn open_bi(&self, session_id: SessionId) -> OpenBi<C, B> {
+    pub fn open_bi(&self, session_id: SessionId) -> OpenBi<'_, C, B> {
         OpenBi {
             opener: &self.opener,
             stream: None,
@@ -325,7 +325,7 @@ where
     }
 
     /// Open a new unidirectional stream
-    pub fn open_uni(&self, session_id: SessionId) -> OpenUni<C, B> {
+    pub fn open_uni(&self, session_id: SessionId) -> OpenUni<'_, C, B> {
         OpenUni {
             opener: &self.opener,
             stream: None,
@@ -388,7 +388,7 @@ impl ConnectionState for WTransportStreamHandler {
 
 impl CloseStream for WTransportStreamHandler {}
 
-impl<'a, B, C> Future for OpenBi<'a, C, B>
+impl<B, C> Future for OpenBi<'_, C, B>
 where
     C: quic::Connection<B>,
     B: Buf,
@@ -410,7 +410,7 @@ where
                     return Poll::Ready(Ok(stream));
                 }
                 None => {
-                    let mut opener = (*p.opener).lock().unwrap();
+                    let mut opener = p.opener.lock().unwrap();
                     // Open the stream first
                     let res = ready!(opener.poll_open_bidi(cx))
                         .map_err(|err| p.stream_handler.handle_quic_stream_error(err))?;
@@ -446,7 +446,7 @@ pin_project! {
     }
 }
 
-impl<'a, C, B> Future for OpenUni<'a, C, B>
+impl<C, B> Future for OpenUni<'_, C, B>
 where
     C: quic::Connection<B>,
     B: Buf,
@@ -468,7 +468,7 @@ where
                     return Poll::Ready(Ok(send));
                 }
                 None => {
-                    let mut opener = (*p.opener).lock().unwrap();
+                    let mut opener = p.opener.lock().unwrap();
                     let send = ready!(opener.poll_open_send(cx))
                         .map_err(|err| p.stream_handler.handle_quic_stream_error(err))?;
                     let send = BufRecvStream::new(send);
@@ -503,7 +503,7 @@ where
     conn: &'a Mutex<Connection<C, B>>,
 }
 
-impl<'a, C, B> Future for AcceptUni<'a, C, B>
+impl<C, B> Future for AcceptUni<'_, C, B>
 where
     C: quic::Connection<B>,
     B: Buf,

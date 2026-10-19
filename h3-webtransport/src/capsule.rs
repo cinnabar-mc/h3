@@ -3,7 +3,7 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use h3::{
     error::{Code, StreamError},
-    proto::{coding::Encode, varint::VarInt},
+    proto::varint::VarInt,
 };
 
 const CLOSE_SESSION: VarInt = VarInt::from_u32(0x2843);
@@ -192,7 +192,8 @@ mod tests {
         for _ in 0..128 {
             assert!(decoder.receive(&mut &[0xff; 64][..]).unwrap().is_none());
         }
-        let closed = decoder.receive(&mut ORIGINAL_CLOSE).unwrap().unwrap();
+        let mut original = ORIGINAL_CLOSE;
+        let closed = decoder.receive(&mut original).unwrap().unwrap();
         assert_eq!(closed.code, 42);
         assert_eq!(closed.reason, &b"x"[..]);
     }
