@@ -151,3 +151,48 @@ async fn session_close_guard_retains_h3_through_actual_peer_data_and_fin() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn session_close_retains_validated_trailer_wait_across_canceled_borrow() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let mut fixture = Fixture::new().await;
+        let observed = {
+            let session = fixture.session.as_ref().unwrap();
+            let (continue_fin, finish) = tokio::sync::oneshot::channel();
+            let peer = async {
+                let mut fields = http::HeaderMap::new();
+                fields.insert("x-proof", "yes".parse().unwrap());
+                fixture.request.send_trailers(fields).await.unwrap();
+                finish.await.unwrap();
+                fixture.request.finish().await.unwrap();
+            };
+            let host = async {
+                let mut original = Box::pin(session.recv_session_close());
+                poll_fn(|cx| {
+                    assert!(original.as_mut().poll(cx).is_pending());
+                    // The original close owner consumed HEADERS and is waiting on the same FIN.
+                    if session.connect_control.lock().unwrap().receiving_trailers {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await;
+                drop(original);
+                continue_fin.send(()).unwrap();
+                let first = session.recv_session_close().await.unwrap();
+                let repeated = session.recv_session_close().await.unwrap();
+                (first, repeated)
+            };
+            tokio::select! {
+                (_, observed) = async { tokio::join!(peer, host) } => observed,
+                error = poll_fn(|cx| fixture.driver.poll_close(cx)) => panic!("peer control failed: {error:?}"),
+                error = session.maintain() => panic!("host control failed: {error:?}"),
+            }
+        };
+        fixture.retire().await;
+        assert_eq!(observed, (None, None));
+    })
+    .await
+    .unwrap();
+}
