@@ -10,6 +10,7 @@ mod h3_quinn;
 
 mod connection;
 mod encoded_headers;
+mod header_validation;
 mod request;
 
 use std::{
