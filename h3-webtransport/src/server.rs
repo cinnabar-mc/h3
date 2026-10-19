@@ -356,11 +356,23 @@ type PendingUniStreams<C, B> = (
 
 pin_project! {
     /// Future for opening a bidi stream
+    ///
+    /// Dropping a retained partial prefix resets its send side and stops its receive side. A completed
+    /// future has transferred its stream and leaves that returned owner untouched.
     pub struct OpenBi<'a, C:quic::Connection<B>, B:Buf> {
         opener: &'a Mutex<C::OpenStreams>,
         stream: Option<PendingStreams<C,B>>,
         session_id: SessionId,
         stream_handler: WTransportStreamHandler,
+    }
+
+    impl<C: quic::Connection<B>, B: Buf> PinnedDrop for OpenBi<'_, C, B> {
+        fn drop(this: Pin<&mut Self>) {
+            if let Some((stream, _)) = this.project().stream {
+                quic::SendStream::reset(stream, Code::H3_REQUEST_CANCELLED.value());
+                quic::RecvStream::stop_sending(stream, Code::H3_REQUEST_CANCELLED.value());
+            }
+        }
     }
 }
 
@@ -414,12 +426,23 @@ where
 
 pin_project! {
     /// Opens a unidirectional stream
+    ///
+    /// Dropping a retained partial prefix resets its original send stream. A completed
+    /// future has transferred its stream and leaves that returned owner untouched.
     pub struct OpenUni<'a, C: quic::Connection<B>, B:Buf> {
         opener: &'a Mutex<C::OpenStreams>,
         stream: Option<PendingUniStreams<C, B>>,
         // Future for opening a uni stream
         session_id: SessionId,
         stream_handler: WTransportStreamHandler
+    }
+
+    impl<C: quic::Connection<B>, B: Buf> PinnedDrop for OpenUni<'_, C, B> {
+        fn drop(this: Pin<&mut Self>) {
+            if let Some((stream, _)) = this.project().stream {
+                quic::SendStream::reset(stream, Code::H3_REQUEST_CANCELLED.value());
+            }
+        }
     }
 }
 
