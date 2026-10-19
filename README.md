@@ -2,6 +2,13 @@
 
 An async HTTP/3 implementation.
 
+This is Cinnabar's maintained fork of [hyperium/h3](https://github.com/hyperium/h3).
+It keeps the h3 0.0.8, h3-quinn 0.0.10 and h3-webtransport 0.1.2 crates together
+for Cinnabar's browser gateway. Fork additions include bounded encoded headers,
+strict trailer validation and cancellation-safe WebTransport session controls.
+See the [WebTransport API notes](h3-webtransport/readme.md). The original MIT
+license and upstream attribution remain in place.
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/hyperium/h3/workflows/CI/badge.svg)](https://github.com/hyperium/h3/actions?query=workflow%3ACI)
 [![Discord chat](https://img.shields.io/discord/500028886025895936.svg?logo=discord)](https://discord.gg/q5mVhMD)
