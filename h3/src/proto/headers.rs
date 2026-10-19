@@ -485,6 +485,108 @@ mod tests {
     use assert_matches::assert_matches;
 
     #[test]
+    fn header_validation_rejects_duplicate_pseudo_fields() {
+        for (name, value) in [
+            (":method", "CONNECT"),
+            (":scheme", "https"),
+            (":authority", "example.test"),
+            (":path", "/relay"),
+            (":status", "200"),
+            (":protocol", "webtransport"),
+        ] {
+            let field = HeaderField::from((name, value));
+            Header::try_from(vec![field.clone()]).expect("one valid pseudo field");
+            assert!(
+                Header::try_from(vec![field.clone(), field]).is_err(),
+                "duplicate {name} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn header_validation_rejects_pseudo_fields_after_ordinary_fields() {
+        for (name, value) in [
+            (":method", "CONNECT"),
+            (":scheme", "https"),
+            (":authority", "example.test"),
+            (":path", "/relay"),
+            (":status", "200"),
+            (":protocol", "webtransport"),
+        ] {
+            let field = HeaderField::from((name, value));
+            let ordinary = HeaderField::from(("origin", "https://page.test"));
+            Header::try_from(vec![field.clone(), ordinary.clone()])
+                .expect("pseudo field before ordinary field");
+            assert!(
+                Header::try_from(vec![ordinary, field]).is_err(),
+                "late {name} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn header_validation_rejects_pseudo_fields_in_the_wrong_message_context() {
+        let request = vec![
+            HeaderField::from((":method", "GET")),
+            HeaderField::from((":authority", "example.test")),
+        ];
+        Header::try_from(request.clone())
+            .unwrap()
+            .into_request_parts()
+            .expect("ordinary request");
+        let mut mixed = request;
+        mixed.push((":status", "200").into());
+        assert!(
+            Header::try_from(mixed)
+                .and_then(Header::into_request_parts)
+                .is_err(),
+            "response status was accepted in a request"
+        );
+
+        for (name, value) in [
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":authority", "example.test"),
+            (":path", "/relay"),
+            (":protocol", "webtransport"),
+        ] {
+            Header::try_from(vec![(":status", "200").into()])
+                .unwrap()
+                .into_response_parts()
+                .expect("ordinary response");
+            assert!(
+                Header::try_from(vec![(":status", "200").into(), (name, value).into()])
+                    .and_then(Header::into_response_parts)
+                    .is_err(),
+                "request field {name} was accepted in a response"
+            );
+        }
+    }
+
+    #[test]
+    fn header_validation_preserves_original_origin_occurrences() {
+        for first in ["", "https://first.test"] {
+            let (_, _, _, fields) = Header::try_from(vec![
+                (":method", "GET").into(),
+                (":authority", "example.test").into(),
+                ("origin", first).into(),
+                ("origin", "https://second.test").into(),
+            ])
+            .unwrap()
+            .into_request_parts()
+            .expect("ordinary duplicate origins remain valid");
+            assert_eq!(fields.get("origin").unwrap(), first);
+            assert_eq!(
+                fields.get_all("origin").iter().collect::<Vec<_>>(),
+                vec![
+                    &HeaderValue::from_str(first).unwrap(),
+                    &HeaderValue::from_static("https://second.test"),
+                ]
+            );
+        }
+    }
+
+    #[test]
     fn request_has_no_authority_nor_host() {
         //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
         //= type=test
