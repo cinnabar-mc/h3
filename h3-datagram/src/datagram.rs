@@ -20,6 +20,7 @@ where
     B: Buf,
 {
     /// Creates a new datagram frame
+    #[allow(clippy::manual_is_multiple_of)] // Keep the original Rust 1.70-compatible operation.
     pub fn new(stream_id: StreamId, payload: B) -> Self {
         assert!(
             stream_id.into_inner() % 4 == 0,
@@ -106,7 +107,7 @@ where
 
     fn chunk(&self) -> &[u8] {
         if self.len - self.pos > 0 {
-            return &self.stream_id[self.pos..self.len];
+            &self.stream_id[self.pos..self.len]
         } else {
             self.payload.chunk()
         }
