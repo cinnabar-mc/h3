@@ -105,6 +105,20 @@ impl Builder {
         self
     }
 
+    /// Indicates to the peer that WebTransport is supported.
+    ///
+    /// Also enable datagrams and extended CONNECT for WebTransport sessions.
+    pub fn enable_webtransport(&mut self, enabled: bool) -> &mut Self {
+        self.config.settings.enable_webtransport = enabled;
+        self
+    }
+
+    /// Advertises the maximum number of WebTransport sessions accepted from the peer.
+    pub fn max_webtransport_sessions(&mut self, value: u64) -> &mut Self {
+        self.config.settings.max_webtransport_sessions = value;
+        self
+    }
+
     /// Enables the extended CONNECT protocol required for various HTTP/3 extensions.
     pub fn enable_extended_connect(&mut self, value: bool) -> &mut Self {
         self.config.settings.enable_extended_connect = value;

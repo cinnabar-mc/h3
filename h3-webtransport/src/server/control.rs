@@ -57,3 +57,6 @@ impl<S: quic::RecvStream, B: Buf> ConnectControl<S, B> {
         Poll::Pending
     }
 }
+
+#[cfg(test)]
+mod tests;
