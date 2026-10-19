@@ -707,6 +707,10 @@ fn convert_to_std_io_error(error: StreamErrorIncoming) -> std::io::Error {
 }
 
 #[cfg(test)]
+#[path = "stream/uni_preface_tests.rs"]
+mod uni_preface_tests;
+
+#[cfg(test)]
 mod tests {
     use crate::proto::coding::BufExt;
 
