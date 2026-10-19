@@ -11,10 +11,16 @@ pub(super) enum Role {
     Bi,
 }
 
+/// Associates a caller task with the exact borrowed wait that registered it.
+struct Registration {
+    token: Arc<()>,
+    waker: Waker,
+}
+
 /// Fans actual connection wakes out to the finite set of original driver waiters.
 #[derive(Default)]
 pub(super) struct DriverWake {
-    waiters: Mutex<[Option<(Arc<()>, Waker)>; 3]>,
+    waiters: Mutex<[Option<Registration>; 3]>,
 }
 
 impl DriverWake {
@@ -33,8 +39,8 @@ impl DriverWake {
             let mut registered = self.waiters.lock().unwrap();
             std::mem::take(&mut *registered)
         };
-        for (_, waker) in waiters.into_iter().flatten() {
-            waker.wake();
+        for registration in waiters.into_iter().flatten() {
+            registration.waker.wake();
         }
     }
 }
@@ -63,9 +69,13 @@ impl Waiter<'_> {
         cx: &mut Context<'_>,
         poll: impl FnOnce(&mut Context<'_>) -> Poll<T>,
     ) -> Poll<T> {
+        let registration = Registration {
+            token: Arc::clone(&self.token),
+            waker: cx.waker().clone(),
+        };
         let replaced = {
             let mut waiters = self.driver.waiters.lock().unwrap();
-            waiters[self.role as usize].replace((Arc::clone(&self.token), cx.waker().clone()))
+            waiters[self.role as usize].replace(registration)
         };
         drop(replaced);
         let waker = Waker::from(Arc::clone(self.driver));
@@ -82,7 +92,7 @@ impl Waiter<'_> {
             let mut waiters = self.driver.waiters.lock().unwrap();
             let slot = &mut waiters[self.role as usize];
             match slot {
-                Some((token, _)) if Arc::ptr_eq(token, &self.token) => slot.take(),
+                Some(registration) if Arc::ptr_eq(&registration.token, &self.token) => slot.take(),
                 _ => None,
             }
         };
