@@ -1,5 +1,5 @@
-use bytes::{Bytes, BytesMut};
-use h3::{error::StreamError, proto::frame::Frame};
+use bytes::{BufMut, Bytes, BytesMut};
+use h3::{error::StreamError, proto::frame::Frame, stream::WriteBuf};
 use std::{sync::Arc, time::Duration};
 
 use crate::{server::WebTransportSession, SessionClose};
@@ -60,10 +60,10 @@ async fn actual_close(trailers: Bytes, data_after_trailers: bool) -> (Observed, 
             b"\x00\x00\xcf\xd7\x50\x09localhost\x51\x06/relay\x27\x02:protocol\x0cwebtransport",
         );
         let mut wire = BytesMut::new();
-        Frame::<Bytes>::Headers(request).encode_with_payload(&mut wire);
-        Frame::<Bytes>::Headers(trailers).encode_with_payload(&mut wire);
+        wire.put(WriteBuf::from(Frame::<Bytes>::Headers(request)));
+        wire.put(WriteBuf::from(Frame::<Bytes>::Headers(trailers)));
         if data_after_trailers {
-            Frame::Data(Bytes::from_static(b"x")).encode_with_payload(&mut wire);
+            wire.put(WriteBuf::from(Frame::Data(Bytes::from_static(b"x"))));
         }
         send.write_all(&wire).await.unwrap();
         send.finish().unwrap();
