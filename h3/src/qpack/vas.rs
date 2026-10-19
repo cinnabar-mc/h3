@@ -67,7 +67,6 @@
  * pst:-      pst:-   pst:-       pst:2
  * pos:-      pos:0   pos:2       pos:6
  */
-
 pub type RelativeIndex = usize;
 pub type AbsoluteIndex = usize;
 
