@@ -121,8 +121,12 @@ impl Header {
         Ok((status, self.fields))
     }
 
-    pub fn into_fields(self) -> HeaderMap {
-        self.fields
+    /// Extracts trailers only when their original field section has no pseudo-fields.
+    pub fn into_trailer_fields(self) -> Result<HeaderMap, HeaderError> {
+        if self.pseudo.len != 0 {
+            return Err(HeaderError::InvalidPseudoFieldContext);
+        }
+        Ok(self.fields)
     }
 
     pub fn len(&self) -> usize {
