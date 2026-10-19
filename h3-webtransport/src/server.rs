@@ -6,7 +6,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use bytes::Buf;
+use bytes::{Buf, Bytes};
 use futures_util::{future::poll_fn, ready, Future};
 use h3::{
     error::{
@@ -34,6 +34,10 @@ use h3::webtransport::SessionId;
 use pin_project_lite::pin_project;
 
 use crate::stream::{BidiStream, RecvStream, SendStream};
+use crate::{capsule::encode_close, SessionClose};
+
+mod control;
+use control::ConnectControl;
 
 /// WebTransport session driver.
 ///
@@ -50,12 +54,42 @@ where
     session_id: SessionId,
     /// The underlying HTTP/3 connection
     server_conn: Mutex<Connection<C, B>>,
-    connect_stream: RequestStream<C::BidiStream, B>,
+    connect_control: Mutex<ConnectControl<C::BidiStream, B>>,
     opener: Mutex<C::OpenStreams>,
     /// Shared State
     ///
     /// Shared state is already in server_conn, but with this it is not necessary to lock the mutex
     shared: Arc<SharedState>,
+}
+
+/// Retains the original HTTP3 owner after local session-close DATA and FIN were accepted.
+///
+/// It has no application stream admission API. Drive its control work while the caller's
+/// original finite physical-close policy retires QUIC. Dropping it closes the connection;
+/// merely retaining a cloned QUIC handle does not postpone that close.
+pub struct ClosedWebTransportSession<C, B>
+where
+    C: quic::Connection<B> + quic_traits::DatagramConnectionExt<B>,
+    Connection<C, B>: HandleDatagramsExt<C, B>,
+    B: Buf,
+{
+    session: WebTransportSession<C, B>,
+}
+
+impl<C, B> ClosedWebTransportSession<C, B>
+where
+    C: quic::Connection<B> + quic_traits::DatagramConnectionExt<B>,
+    Connection<C, B>: HandleDatagramsExt<C, B>,
+    B: Buf,
+{
+    /// Drives the same original HTTP3 control owner through bounded physical retirement.
+    ///
+    /// Remains pending while healthy; the first connection failure completes the wait.
+    /// Canceling this borrowed wait retains partial control state. Poll only one maintenance
+    /// driver beside the caller's physical-close observation and original absolute cutoff.
+    pub async fn maintain(&self) -> Result<(), ConnectionError> {
+        self.session.maintain().await
+    }
 }
 
 impl<C, B> ConnectionState for WebTransportSession<C, B>
@@ -150,7 +184,7 @@ where
             session_id,
             opener,
             server_conn: Mutex::new(conn),
-            connect_stream: stream,
+            connect_control: Mutex::new(ConnectControl::new(stream)),
             shared,
         })
     }
@@ -167,7 +201,67 @@ where
         self.server_conn
             .lock()
             .unwrap()
-            .get_datagram_sender(self.connect_stream.send_id())
+            .get_datagram_sender(self.connect_control.lock().unwrap().stream.send_id())
+    }
+
+    /// Observes the original CONNECT close capsule, clean EOF, or first stream/protocol failure.
+    ///
+    /// Dropping this borrowed wait retains partial input and the exact terminal for later calls.
+    /// The caller remains responsible for retiring its already derived application streams.
+    pub async fn recv_session_close(&self) -> Result<Option<SessionClose>, Arc<StreamError>> {
+        poll_fn(|cx| self.connect_control.lock().unwrap().poll_closed(cx)).await
+    }
+
+    /// Drives the original HTTP3 control streams even when application accept slots are full.
+    ///
+    /// Healthy progress stays pending; only a terminal connection failure completes this wait.
+    /// A canceled borrowed wait retains partial input. Poll one maintenance driver, not
+    /// competing maintenance waits; this neither accepts requests nor starts another reader.
+    pub async fn maintain(&self) -> Result<(), ConnectionError> {
+        poll_fn(|cx| self.server_conn.lock().unwrap().poll_control(cx)).await
+    }
+
+    /// Sends one bounded close capsule and finishes the original CONNECT response direction.
+    ///
+    /// Retain this consuming future under the caller's existing finite retirement budget.
+    /// Dropping it is abortive; completion reports local write/FIN, not remote receipt.
+    /// A previously observed peer terminal causes no additional close capsule.
+    /// The returned owner keeps HTTP3 alive until the caller deliberately retires physical QUIC.
+    /// The caller must first retire its derived application streams and retain the returned
+    /// owner while driving control and physical-close work under the same original cutoff.
+    pub async fn close(
+        self,
+        code: u32,
+        reason: &str,
+    ) -> Result<ClosedWebTransportSession<C, B>, StreamError>
+    where
+        B: From<Bytes>,
+    {
+        let Self {
+            session_id,
+            server_conn,
+            connect_control,
+            opener,
+            shared,
+        } = self;
+        let mut control = connect_control.into_inner().unwrap();
+        if !control.terminal_observed() {
+            control
+                .stream
+                .send_data(B::from(encode_close(code, reason)))
+                .await?;
+        }
+        control.stream.stop_sending(Code::H3_NO_ERROR);
+        control.stream.finish().await?;
+        Ok(ClosedWebTransportSession {
+            session: Self {
+                session_id,
+                server_conn,
+                connect_control: Mutex::new(control),
+                opener,
+                shared,
+            },
+        })
     }
 
     /// Accept an incoming unidirectional stream from the client, it reads the stream until EOF.

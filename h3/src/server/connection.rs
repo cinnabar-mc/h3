@@ -219,11 +219,13 @@ where
         }
     }
 
+    /// Drives the original HTTP3 control streams without accepting an application request.
+    ///
+    /// Returns `Pending` while healthy and completes only with a terminal connection error.
+    /// Canceling a borrowed poll retains this connection's original partial control state.
+    /// Poll one owning connection driver; concurrent drivers can replace each other's wakers.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
-    pub(crate) fn poll_control(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), ConnectionError>> {
+    pub fn poll_control(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), ConnectionError>> {
         while (self.poll_next_control(cx)?).is_ready() {}
         Poll::Pending
     }
