@@ -194,6 +194,13 @@ where
         error: FrameStreamError,
     ) -> StreamError {
         match error {
+            FrameStreamError::HeadersTooBig {
+                actual_size,
+                max_size,
+            } => StreamError::HeaderTooBig {
+                actual_size,
+                max_size,
+            },
             FrameStreamError::Quic(error) => self.handle_quic_stream_error(error),
             FrameStreamError::Proto(frame_error) => self.handle_connection_error_on_stream(
                 InternalConnectionError::got_frame_error(frame_error).into(),

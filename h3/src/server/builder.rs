@@ -48,6 +48,7 @@ pub fn builder() -> Builder {
 /// Builder of HTTP/3 server connections.
 pub struct Builder {
     pub(crate) config: Config,
+    max_encoded_headers_size: Option<u64>,
 }
 
 impl Builder {
@@ -55,6 +56,7 @@ impl Builder {
     pub(super) fn new() -> Self {
         Builder {
             config: Default::default(),
+            max_encoded_headers_size: None,
         }
     }
 
@@ -73,6 +75,16 @@ impl Builder {
     /// [header size constraints]: https://www.rfc-editor.org/rfc/rfc9114.html#name-header-size-constraints
     pub fn max_field_section_size(&mut self, value: u64) -> &mut Self {
         self.config.settings.max_field_section_size = value;
+        self
+    }
+
+    /// Limits each encoded request or trailer HEADERS payload before buffering its body.
+    ///
+    /// This local limit is independent of the decoded field-section limit and is not
+    /// advertised to the peer. By default encoded HEADERS have no additional limit.
+    /// DATA payloads and WebTransport streams are unaffected.
+    pub fn max_encoded_headers_size(&mut self, value: u64) -> &mut Self {
+        self.max_encoded_headers_size = Some(value);
         self
     }
 
@@ -134,6 +146,7 @@ impl Builder {
         Ok(Connection {
             inner: ConnectionInner::new(conn, Arc::new(shared), self.config).await?,
             max_field_section_size: self.config.settings.max_field_section_size,
+            max_encoded_headers_size: self.max_encoded_headers_size,
             request_end_send: sender,
             request_end_recv: receiver,
             ongoing_streams: HashSet::new(),

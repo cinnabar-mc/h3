@@ -48,6 +48,7 @@ where
     /// TODO: temporarily break encapsulation for `WebTransportSession`
     pub inner: ConnectionInner<C, B>,
     pub(super) max_field_section_size: u64,
+    pub(super) max_encoded_headers_size: Option<u64>,
     // List of all incoming streams that are currently running.
     pub(super) ongoing_streams: HashSet<StreamId>,
     // Let the streams tell us when they are no longer running.
@@ -142,8 +143,9 @@ where
 
     fn create_resolver_internal(
         &self,
-        stream: FrameStream<C::BidiStream, B>,
+        mut stream: FrameStream<C::BidiStream, B>,
     ) -> RequestResolver<C, B> {
+        stream.set_max_encoded_headers_size(self.max_encoded_headers_size);
         RequestResolver {
             frame_stream: stream,
             request_end_send: self.request_end_send.clone(),

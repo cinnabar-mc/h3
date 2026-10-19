@@ -87,6 +87,13 @@ where
         let mut encoded = match frame {
             Ok(Some(Frame::Headers(h))) => h,
 
+            Err(FrameStreamError::HeadersTooBig {
+                actual_size,
+                max_size,
+            }) => {
+                return Ok(self.into_resolved_request(Err(actual_size), max_size));
+            }
+
             //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
             //# If a client-initiated
             //# stream terminates without enough of the HTTP message to provide a
@@ -141,6 +148,16 @@ where
             }
         };
 
+        let limit = self.max_field_section_size;
+        Ok(self.into_resolved_request(decoded, limit))
+    }
+
+    /// Reuses the original response and stream owner for encoded and decoded budget refusals.
+    fn into_resolved_request(
+        self,
+        decoded: Result<qpack::Decoded, u64>,
+        limit: u64,
+    ) -> ResolvedRequest<C, B> {
         let request_stream = RequestStream {
             request_end: Arc::new(RequestEnd {
                 request_end: self.request_end_send.clone(),
@@ -154,11 +171,7 @@ where
             ),
         };
 
-        Ok(ResolvedRequest::new(
-            request_stream,
-            decoded,
-            self.max_field_section_size,
-        ))
+        ResolvedRequest::new(request_stream, decoded, limit)
     }
 }
 

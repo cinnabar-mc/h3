@@ -36,6 +36,11 @@ impl<S, B> FrameStream<S, B> {
         }
     }
 
+    /// Installs the server's local encoded HEADERS limit before the first frame poll.
+    pub(crate) fn set_max_encoded_headers_size(&mut self, limit: Option<u64>) {
+        self.decoder.max_encoded_headers_size = limit;
+    }
+
     /// Unwraps the Framed streamer and returns the underlying stream **without** data loss for
     /// partially received/read frames.
     pub fn into_inner(self) -> BufRecvStream<S, B> {
@@ -62,7 +67,14 @@ where
         loop {
             let end = self.try_recv(cx)?;
 
-            return match self.decoder.decode(self.stream.buf_mut())? {
+            let decoded = match self.decoder.decode(self.stream.buf_mut()) {
+                Err(error @ FrameStreamError::HeadersTooBig { .. }) => {
+                    self.stream.stop_sending(Code::H3_EXCESSIVE_LOAD.into());
+                    return Poll::Ready(Err(error));
+                }
+                result => result?,
+            };
+            return match decoded {
                 Some(Frame::Data(PayloadLen(len))) => {
                     self.remaining_data = len;
                     Poll::Ready(Ok(Some(Frame::Data(PayloadLen(len)))))
@@ -205,6 +217,7 @@ where
 #[derive(Default)]
 pub struct FrameDecoder {
     expected: Option<usize>,
+    max_encoded_headers_size: Option<u64>,
 }
 
 impl FrameDecoder {
@@ -227,7 +240,11 @@ impl FrameDecoder {
 
             let (pos, decoded) = {
                 let mut cur = src.cursor();
-                let decoded = Frame::decode(&mut cur);
+                let decoded = if self.max_encoded_headers_size.is_some() {
+                    Frame::decode_with_max_headers(&mut cur, self.max_encoded_headers_size)
+                } else {
+                    Frame::decode(&mut cur)
+                };
                 (cur.position(), decoded)
             };
 
@@ -279,6 +296,15 @@ impl FrameDecoder {
                 Err(frame::FrameError::Malformed) => {
                     return Err(FrameStreamError::Proto(FrameProtocolError::Malformed));
                 }
+                Err(frame::FrameError::HeadersTooBig {
+                    actual_size,
+                    max_size,
+                }) => {
+                    return Err(FrameStreamError::HeadersTooBig {
+                        actual_size,
+                        max_size,
+                    });
+                }
             }
         }
     }
@@ -290,6 +316,11 @@ pub enum FrameStreamError {
     Proto(FrameProtocolError),
     Quic(StreamErrorIncoming),
     UnexpectedEnd,
+    /// An encoded HEADERS length exceeded the selected local limit before its body was read.
+    HeadersTooBig {
+        actual_size: u64,
+        max_size: u64,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -315,6 +346,90 @@ mod tests {
     use crate::proto::{coding::Encode, frame::FrameType, varint::VarInt};
 
     // Decoder
+
+    #[test]
+    fn encoded_headers_reject_fragmented_length_before_payload() {
+        let limit = 4096;
+        let mut wire = BytesMut::new();
+        FrameType::HEADERS.encode(&mut wire);
+        VarInt::from_u64(limit + 1).unwrap().encode(&mut wire);
+        let mut input = BufList::from(wire.split_to(2));
+        let mut decoder = FrameDecoder {
+            max_encoded_headers_size: Some(limit),
+            ..Default::default()
+        };
+        assert_matches!(decoder.decode(&mut input), Ok(None));
+        input.push(wire);
+        assert_matches!(
+            decoder.decode(&mut input),
+            Err(FrameStreamError::HeadersTooBig { actual_size, max_size })
+                if actual_size == limit + 1 && max_size == limit
+        );
+    }
+
+    #[test]
+    fn encoded_headers_default_and_exact_boundary_preserve_payload() {
+        let payload = Bytes::from_static(b"original");
+        for limit in [None, Some(payload.len() as u64)] {
+            let mut wire = BytesMut::new();
+            Frame::Headers(payload.clone()).encode_with_payload(&mut wire);
+            let mut input = BufList::from(wire);
+            let mut decoder = FrameDecoder {
+                max_encoded_headers_size: limit,
+                ..Default::default()
+            };
+            assert_matches!(
+                decoder.decode(&mut input),
+                Ok(Some(Frame::Headers(decoded))) if decoded == payload
+            );
+        }
+    }
+
+    #[test]
+    fn encoded_headers_limit_does_not_limit_data_or_webtransport() {
+        let mut data = BytesMut::new();
+        FrameType::DATA.encode(&mut data);
+        VarInt::from(8192u32).encode(&mut data);
+        let mut decoder = FrameDecoder {
+            max_encoded_headers_size: Some(0),
+            ..Default::default()
+        };
+        assert_matches!(
+            decoder.decode(&mut BufList::from(data)),
+            Ok(Some(Frame::Data(PayloadLen(8192))))
+        );
+        let session = crate::webtransport::SessionId::try_from(0).unwrap();
+        let mut stream = BytesMut::new();
+        Frame::<Bytes>::WebTransportStream(session).encode_with_payload(&mut stream);
+        assert_matches!(
+            decoder.decode(&mut BufList::from(stream)),
+            Ok(Some(Frame::WebTransportStream(id))) if id == session
+        );
+    }
+
+    #[test]
+    fn encoded_headers_decoded_field_budget_remains_independent() {
+        let field = crate::qpack::HeaderField::from((":method", "GET"));
+        let decoded_size = field.mem_size() as u64;
+        let mut encoded = BytesMut::new();
+        crate::qpack::encode_stateless(&mut encoded, vec![field]).unwrap();
+        let limit = encoded.len() as u64;
+        let mut wire = BytesMut::new();
+        Frame::Headers(encoded.freeze()).encode_with_payload(&mut wire);
+        let mut decoder = FrameDecoder {
+            max_encoded_headers_size: Some(limit),
+            ..Default::default()
+        };
+        let mut decoded = match decoder.decode(&mut BufList::from(wire)).unwrap() {
+            Some(Frame::Headers(encoded)) => encoded,
+            _ => panic!("actual original HEADERS frame"),
+        };
+        assert_matches!(
+            crate::qpack::decode_stateless(&mut decoded.clone(), decoded_size - 1),
+            Err(crate::qpack::DecoderError::HeaderTooLong(size)) if size == decoded_size
+        );
+        assert!(crate::qpack::decode_stateless(&mut decoded, decoded_size).is_ok());
+    }
 
     #[test]
     fn one_frame() {

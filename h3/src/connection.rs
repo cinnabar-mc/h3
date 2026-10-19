@@ -525,6 +525,14 @@ where
         };
 
         let res = match ready!(recv.poll_next(cx)) {
+            Err(FrameStreamError::HeadersTooBig { .. }) => {
+                return Poll::Ready(Err(self.handle_connection_error(
+                    InternalConnectionError::new(
+                        Code::H3_EXCESSIVE_LOAD,
+                        "encoded control headers exceed local limit".to_string(),
+                    ),
+                )));
+            }
             Err(FrameStreamError::Quic(StreamErrorIncoming::ConnectionErrorIncoming {
                 connection_error,
             })) => return Poll::Ready(Err(self.handle_connection_error(connection_error))),
