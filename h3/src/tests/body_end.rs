@@ -7,7 +7,6 @@ use crate::{
     client,
     error::{Code, ConnectionError, LocalError, StreamError},
     proto::{
-        coding::Encode,
         frame::{Frame, FrameType},
         headers::Header,
         varint::VarInt,
@@ -229,9 +228,10 @@ async fn actual_body(client_receives: bool, body: Body) -> Observed {
     };
     let server = async {
         let host = endpoint.accept().await.unwrap().await.unwrap();
-        let mut connection = server::Connection::new(h3_quinn::Connection::new(host.clone()))
-            .await
-            .unwrap();
+        let mut connection =
+            server::Connection::<_, Bytes>::new(h3_quinn::Connection::new(host.clone()))
+                .await
+                .unwrap();
         let result = if client_receives {
             let (observation, prefix_read) = server_write.unwrap();
             let (mut send, recv) = host.accept_bi().await.unwrap();
