@@ -8,6 +8,7 @@ mod fixture;
 mod opening;
 mod pending_receive;
 mod trailers;
+mod wakeups;
 use fixture::Fixture;
 
 #[tokio::test]
