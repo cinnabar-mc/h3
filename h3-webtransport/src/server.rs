@@ -7,7 +7,10 @@ use std::{
 };
 
 use bytes::{Buf, Bytes};
-use futures_util::{future::poll_fn, ready, Future};
+use futures_util::{
+    future::{poll_fn, Shared},
+    ready, Future, FutureExt,
+};
 use h3::{
     error::{
         connection_error_creators::CloseStream, internal_error::InternalConnectionError, Code,
@@ -37,7 +40,7 @@ use crate::stream::{BidiStream, RecvStream, SendStream};
 use crate::{capsule::encode_close, SessionClose};
 
 mod control;
-use control::ConnectControl;
+use control::{ConnectClose, ConnectControl};
 mod wake;
 use wake::{DriverWake, Role, Waiter};
 
@@ -57,7 +60,9 @@ where
     /// The underlying HTTP/3 connection
     server_conn: Mutex<Connection<C, B>>,
     driver_wake: Arc<DriverWake>,
-    connect_control: Mutex<ConnectControl<C::BidiStream, B>>,
+    connect_control: Arc<Mutex<ConnectControl<C::BidiStream, B>>>,
+    // Only the private closed wrapper has no observer; it exposes maintenance alone.
+    session_close: Option<Shared<ConnectClose<C::BidiStream, B>>>,
     opener: Mutex<C::OpenStreams>,
     /// Shared State
     ///
@@ -182,13 +187,16 @@ where
         let session_id = stream.send_id().into();
         let conn_inner = &mut conn.inner.conn;
         let opener = Mutex::new(conn_inner.opener());
+        let connect_control = Arc::new(Mutex::new(ConnectControl::new(stream)));
+        let session_close = ConnectClose::new(Arc::clone(&connect_control)).shared();
 
         Ok(Self {
             session_id,
             opener,
             server_conn: Mutex::new(conn),
             driver_wake: Arc::default(),
-            connect_control: Mutex::new(ConnectControl::new(stream)),
+            connect_control,
+            session_close: Some(session_close),
             shared,
         })
     }
@@ -211,9 +219,14 @@ where
     /// Observes the original CONNECT close capsule, clean EOF, or first stream/protocol failure.
     ///
     /// Dropping this borrowed wait retains partial input and the exact terminal for later calls.
+    /// Concurrent observers share one physical reader and each wakes when its terminal completes.
     /// The caller remains responsible for retiring its already derived application streams.
     pub async fn recv_session_close(&self) -> Result<Option<SessionClose>, Arc<StreamError>> {
-        poll_fn(|cx| self.connect_control.lock().unwrap().poll_closed(cx)).await
+        self.session_close
+            .as_ref()
+            .expect("a live session owns its CONNECT close observation")
+            .clone()
+            .await
     }
 
     /// Drives the original HTTP3 control streams even when application accept slots are full.
@@ -247,11 +260,25 @@ where
             session_id,
             server_conn,
             driver_wake,
-            connect_control,
+            mut connect_control,
+            session_close,
             opener,
             shared,
         } = self;
-        let mut control = connect_control.into_inner().unwrap();
+        // Borrowed observers have ended; dropping the base releases its physical reader.
+        drop(session_close);
+        let control = Arc::get_mut(&mut connect_control)
+            .ok_or_else(|| {
+                let mut handler = WTransportStreamHandler {
+                    shared: Arc::clone(&shared),
+                };
+                handler.handle_connection_error_on_stream(InternalConnectionError::new(
+                    Code::H3_INTERNAL_ERROR,
+                    "CONNECT close observer retained after session consumption".to_string(),
+                ))
+            })?
+            .get_mut()
+            .unwrap();
         if !control.terminal_observed() {
             control
                 .stream
@@ -265,7 +292,8 @@ where
                 session_id,
                 server_conn,
                 driver_wake,
-                connect_control: Mutex::new(control),
+                connect_control,
+                session_close: None,
                 opener,
                 shared,
             },

@@ -2,14 +2,36 @@
 
 use crate::capsule::{Capsules, SessionClose};
 use bytes::Buf;
+use futures_util::Future;
 use h3::{error::StreamError, quic, server::RequestStream};
 use std::{
-    sync::Arc,
+    pin::Pin,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
 };
 
 type Closed = Result<Option<SessionClose>, Arc<StreamError>>;
 const DATA_CHUNKS_PER_POLL: usize = 32;
+
+/// The single physical CONNECT reader shared by all borrowed close observers.
+pub(super) struct ConnectClose<S, B> {
+    control: Arc<Mutex<ConnectControl<S, B>>>,
+}
+
+impl<S, B> ConnectClose<S, B> {
+    /// Retains the original control owner until the shared observation completes or drops.
+    pub(super) fn new(control: Arc<Mutex<ConnectControl<S, B>>>) -> Self {
+        Self { control }
+    }
+}
+
+impl<S: quic::RecvStream, B: Buf> Future for ConnectClose<S, B> {
+    type Output = Closed;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.control.lock().unwrap().poll_closed(cx)
+    }
+}
 
 pub(super) struct ConnectControl<S, B> {
     pub(super) stream: RequestStream<S, B>,
