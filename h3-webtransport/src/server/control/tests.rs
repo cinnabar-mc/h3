@@ -6,6 +6,7 @@ use crate::SessionClose;
 
 mod fixture;
 mod opening;
+mod trailers;
 use fixture::Fixture;
 
 #[tokio::test]
