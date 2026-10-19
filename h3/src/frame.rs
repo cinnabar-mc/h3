@@ -24,7 +24,8 @@ pub struct FrameStream<S, B> {
     pub stream: BufRecvStream<S, B>,
     // Already read data from the stream
     decoder: FrameDecoder,
-    remaining_data: usize,
+    // Some(n) is finite DATA (zero is idle); None is an unbounded WebTransport body.
+    remaining_data: Option<usize>,
 }
 
 impl<S, B> FrameStream<S, B> {
@@ -32,7 +33,7 @@ impl<S, B> FrameStream<S, B> {
         Self {
             stream,
             decoder: FrameDecoder::default(),
-            remaining_data: 0,
+            remaining_data: Some(0),
         }
     }
 
@@ -60,7 +61,7 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<Frame<PayloadLen>>, FrameStreamError>> {
         assert!(
-            self.remaining_data == 0,
+            self.remaining_data == Some(0),
             "There is still data to read, please call poll_data() until it returns None."
         );
 
@@ -76,11 +77,11 @@ where
             };
             return match decoded {
                 Some(Frame::Data(PayloadLen(len))) => {
-                    self.remaining_data = len;
+                    self.remaining_data = Some(len);
                     Poll::Ready(Ok(Some(Frame::Data(PayloadLen(len)))))
                 }
                 frame @ Some(Frame::WebTransportStream(_)) => {
-                    self.remaining_data = usize::MAX;
+                    self.remaining_data = None;
                     Poll::Ready(Ok(frame))
                 }
                 Some(frame) => Poll::Ready(Ok(Some(frame))),
@@ -110,7 +111,7 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<impl Buf>, FrameStreamError>> {
-        if self.remaining_data == 0 {
+        if self.remaining_data == Some(0) {
             return Poll::Ready(Ok(None));
         };
 
@@ -119,19 +120,26 @@ where
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             Poll::Pending => false,
         };
-        let data = self.stream.buf_mut().take_chunk(self.remaining_data);
+        let remaining = self.remaining_data.unwrap_or(usize::MAX);
+        let data = self.stream.buf_mut().take_chunk(remaining);
 
         match (data, end) {
+            (None, true) if self.remaining_data.is_some() => {
+                Poll::Ready(Err(FrameStreamError::UnexpectedEnd))
+            }
             (None, true) => Poll::Ready(Ok(None)),
             (None, false) => Poll::Pending,
             (Some(d), true)
-                if d.remaining() < self.remaining_data
+                if self.remaining_data.is_some()
+                    && d.remaining() < remaining
                     && !self.stream.buf_mut().has_remaining() =>
             {
                 Poll::Ready(Err(FrameStreamError::UnexpectedEnd))
             }
             (Some(d), _) => {
-                self.remaining_data -= d.remaining();
+                if let Some(remaining) = &mut self.remaining_data {
+                    *remaining -= d.remaining();
+                }
                 Poll::Ready(Ok(Some(d)))
             }
         }
@@ -143,7 +151,7 @@ where
     }
 
     pub(crate) fn has_data(&self) -> bool {
-        self.remaining_data != 0
+        self.remaining_data != Some(0)
     }
 
     pub(crate) fn is_eos(&self) -> bool {
@@ -203,7 +211,7 @@ where
             FrameStream {
                 stream: send,
                 decoder: FrameDecoder::default(),
-                remaining_data: 0,
+                remaining_data: Some(0),
             },
             FrameStream {
                 stream: recv,

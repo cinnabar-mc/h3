@@ -872,6 +872,11 @@ where
                     // Received trailers, no more data expected
                     return Poll::Ready(Ok(None));
                 }
+                Ok(Some(Frame::Data(PayloadLen(0)))) => {
+                    // An empty content frame makes progress without ending the HTTP body.
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
                 Ok(Some(Frame::Data { .. })) => (),
                 Ok(Some(other_frame)) => {
                     //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
