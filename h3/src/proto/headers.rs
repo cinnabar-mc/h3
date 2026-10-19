@@ -59,6 +59,9 @@ impl Header {
     pub fn into_request_parts(
         self,
     ) -> Result<(Method, Uri, Option<Protocol>, HeaderMap), HeaderError> {
+        if self.pseudo.status.is_some() {
+            return Err(HeaderError::InvalidPseudoFieldContext);
+        }
         let mut uri = Uri::builder();
 
         if let Some(path) = self.pseudo.path {
@@ -105,20 +108,25 @@ impl Header {
     }
 
     pub fn into_response_parts(self) -> Result<(StatusCode, HeaderMap), HeaderError> {
+        let status = self.pseudo.status.ok_or(HeaderError::MissingStatus)?;
+        if self.pseudo.len != 1 {
+            return Err(HeaderError::InvalidPseudoFieldContext);
+        }
         //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.2
         //= type=implication
         //# For responses, a single ":status" pseudo-header field is defined that
         //# carries the HTTP status code; see Section 15 of [HTTP].  This pseudo-
         //# header field MUST be included in all responses; otherwise, the
         //# response is malformed (see Section 4.1.2).
-        Ok((
-            self.pseudo.status.ok_or(HeaderError::MissingStatus)?,
-            self.fields,
-        ))
+        Ok((status, self.fields))
     }
 
-    pub fn into_fields(self) -> HeaderMap {
-        self.fields
+    /// Extracts trailers only when their original field section has no pseudo-fields.
+    pub fn into_trailer_fields(self) -> Result<HeaderMap, HeaderError> {
+        if self.pseudo.len != 0 {
+            return Err(HeaderError::InvalidPseudoFieldContext);
+        }
+        Ok(self.fields)
     }
 
     pub fn len(&self) -> usize {
@@ -206,35 +214,41 @@ impl TryFrom<Vec<HeaderField>> for Header {
     fn try_from(headers: Vec<HeaderField>) -> Result<Self, Self::Error> {
         let mut fields = HeaderMap::with_capacity(headers.len());
         let mut pseudo = Pseudo::default();
+        let mut ordinary_seen = false;
 
         for field in headers.into_iter() {
             let (name, value) = field.into_inner();
-            match Field::parse(name, value)? {
+            let parsed = Field::parse(name, value)?;
+            if ordinary_seen && !matches!(parsed, Field::Header(_)) {
+                return Err(HeaderError::PseudoFieldAfterRegular);
+            }
+            match parsed {
                 Field::Method(m) => {
-                    pseudo.method = Some(m);
+                    insert_pseudo(&mut pseudo.method, m)?;
                     pseudo.len += 1;
                 }
                 Field::Scheme(s) => {
-                    pseudo.scheme = Some(s);
+                    insert_pseudo(&mut pseudo.scheme, s)?;
                     pseudo.len += 1;
                 }
                 Field::Authority(a) => {
-                    pseudo.authority = Some(a);
+                    insert_pseudo(&mut pseudo.authority, a)?;
                     pseudo.len += 1;
                 }
                 Field::Path(p) => {
-                    pseudo.path = Some(p);
+                    insert_pseudo(&mut pseudo.path, p)?;
                     pseudo.len += 1;
                 }
                 Field::Status(s) => {
-                    pseudo.status = Some(s);
+                    insert_pseudo(&mut pseudo.status, s)?;
                     pseudo.len += 1;
                 }
                 Field::Header((n, v)) => {
+                    ordinary_seen = true;
                     fields.append(n, v);
                 }
                 Field::Protocol(p) => {
-                    pseudo.protocol = Some(p);
+                    insert_pseudo(&mut pseudo.protocol, p)?;
                     pseudo.len += 1;
                 }
             }
@@ -242,6 +256,15 @@ impl TryFrom<Vec<HeaderField>> for Header {
 
         Ok(Header { pseudo, fields })
     }
+}
+
+/// Retains exactly one occurrence of each typed pseudo-field.
+fn insert_pseudo<T>(slot: &mut Option<T>, value: T) -> Result<(), HeaderError> {
+    if slot.is_some() {
+        return Err(HeaderError::DuplicatePseudoField);
+    }
+    *slot = Some(value);
+    Ok(())
 }
 
 enum Field {
@@ -438,6 +461,9 @@ pub enum HeaderError {
     MissingStatus,
     MissingAuthority,
     ContradictedAuthority,
+    DuplicatePseudoField,
+    PseudoFieldAfterRegular,
+    InvalidPseudoFieldContext,
 }
 
 impl HeaderError {
@@ -475,6 +501,13 @@ impl fmt::Display for HeaderError {
             HeaderError::ContradictedAuthority => {
                 write!(f, "uri and authority field are in contradiction")
             }
+            HeaderError::DuplicatePseudoField => write!(f, "duplicate pseudo header field"),
+            HeaderError::PseudoFieldAfterRegular => {
+                write!(f, "pseudo header field follows a regular field")
+            }
+            HeaderError::InvalidPseudoFieldContext => {
+                write!(f, "pseudo header field is invalid in this message context")
+            }
         }
     }
 }
@@ -483,6 +516,108 @@ impl fmt::Display for HeaderError {
 mod tests {
     use super::*;
     use assert_matches::assert_matches;
+
+    #[test]
+    fn header_validation_rejects_duplicate_pseudo_fields() {
+        for (name, value) in [
+            (":method", "CONNECT"),
+            (":scheme", "https"),
+            (":authority", "example.test"),
+            (":path", "/relay"),
+            (":status", "200"),
+            (":protocol", "webtransport"),
+        ] {
+            let field = HeaderField::from((name, value));
+            Header::try_from(vec![field.clone()]).expect("one valid pseudo field");
+            assert!(
+                Header::try_from(vec![field.clone(), field]).is_err(),
+                "duplicate {name} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn header_validation_rejects_pseudo_fields_after_ordinary_fields() {
+        for (name, value) in [
+            (":method", "CONNECT"),
+            (":scheme", "https"),
+            (":authority", "example.test"),
+            (":path", "/relay"),
+            (":status", "200"),
+            (":protocol", "webtransport"),
+        ] {
+            let field = HeaderField::from((name, value));
+            let ordinary = HeaderField::from(("origin", "https://page.test"));
+            Header::try_from(vec![field.clone(), ordinary.clone()])
+                .expect("pseudo field before ordinary field");
+            assert!(
+                Header::try_from(vec![ordinary, field]).is_err(),
+                "late {name} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn header_validation_rejects_pseudo_fields_in_the_wrong_message_context() {
+        let request = vec![
+            HeaderField::from((":method", "GET")),
+            HeaderField::from((":authority", "example.test")),
+        ];
+        Header::try_from(request.clone())
+            .unwrap()
+            .into_request_parts()
+            .expect("ordinary request");
+        let mut mixed = request;
+        mixed.push((":status", "200").into());
+        assert!(
+            Header::try_from(mixed)
+                .and_then(Header::into_request_parts)
+                .is_err(),
+            "response status was accepted in a request"
+        );
+
+        for (name, value) in [
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":authority", "example.test"),
+            (":path", "/relay"),
+            (":protocol", "webtransport"),
+        ] {
+            Header::try_from(vec![(":status", "200").into()])
+                .unwrap()
+                .into_response_parts()
+                .expect("ordinary response");
+            assert!(
+                Header::try_from(vec![(":status", "200").into(), (name, value).into()])
+                    .and_then(Header::into_response_parts)
+                    .is_err(),
+                "request field {name} was accepted in a response"
+            );
+        }
+    }
+
+    #[test]
+    fn header_validation_preserves_original_origin_occurrences() {
+        for first in ["", "https://first.test"] {
+            let (_, _, _, fields) = Header::try_from(vec![
+                (":method", "GET").into(),
+                (":authority", "example.test").into(),
+                ("origin", first).into(),
+                ("origin", "https://second.test").into(),
+            ])
+            .unwrap()
+            .into_request_parts()
+            .expect("ordinary duplicate origins remain valid");
+            assert_eq!(fields.get("origin").unwrap(), first);
+            assert_eq!(
+                fields.get_all("origin").iter().collect::<Vec<_>>(),
+                vec![
+                    &HeaderValue::from_str(first).unwrap(),
+                    &HeaderValue::from_static("https://second.test"),
+                ]
+            );
+        }
+    }
 
     #[test]
     fn request_has_no_authority_nor_host() {

@@ -304,7 +304,7 @@ where
         let mut conn_inner = Self {
             shared,
             conn,
-            control_send: control_send,
+            control_send,
             control_recv: None,
             qpack_streams,
             handled_connection_error: None,
@@ -399,17 +399,13 @@ where
         let _ = self.poll_connection_error(cx)?;
 
         // Get all currently pending streams
-        loop {
-            match self
-                .conn
-                .poll_accept_recv(cx)
-                .map_err(|e| self.handle_connection_error(e))?
-            {
-                Poll::Ready(stream) => self
-                    .pending_recv_streams
-                    .push(Some(AcceptRecvStream::new(stream))),
-                Poll::Pending => break,
-            }
+        while let Poll::Ready(stream) = self
+            .conn
+            .poll_accept_recv(cx)
+            .map_err(|e| self.handle_connection_error(e))?
+        {
+            self.pending_recv_streams
+                .push(Some(AcceptRecvStream::new(stream)));
         }
 
         for stream in self.pending_recv_streams.iter_mut().filter(|s| s.is_some()) {
@@ -525,6 +521,14 @@ where
         };
 
         let res = match ready!(recv.poll_next(cx)) {
+            Err(FrameStreamError::HeadersTooBig { .. }) => {
+                return Poll::Ready(Err(self.handle_connection_error(
+                    InternalConnectionError::new(
+                        Code::H3_EXCESSIVE_LOAD,
+                        "encoded control headers exceed local limit".to_string(),
+                    ),
+                )));
+            }
             Err(FrameStreamError::Quic(StreamErrorIncoming::ConnectionErrorIncoming {
                 connection_error,
             })) => return Poll::Ready(Err(self.handle_connection_error(connection_error))),
@@ -868,6 +872,11 @@ where
                     // Received trailers, no more data expected
                     return Poll::Ready(Ok(None));
                 }
+                Ok(Some(Frame::Data(PayloadLen(0)))) => {
+                    // An empty content frame makes progress without ending the HTTP body.
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
                 Ok(Some(Frame::Data { .. })) => (),
                 Ok(Some(other_frame)) => {
                     //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
@@ -1014,14 +1023,14 @@ where
 
         Poll::Ready(Ok(Some(
             Header::try_from(fields)
+                .and_then(Header::into_trailer_fields)
                 .map_err(|_e| {
                     self.stop_sending(Code::H3_MESSAGE_ERROR);
                     StreamError::StreamError {
                         code: Code::H3_MESSAGE_ERROR,
                         reason: "malformed request".to_string(),
                     }
-                })?
-                .into_fields(),
+                })?,
         )))
     }
 

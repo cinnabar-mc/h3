@@ -48,6 +48,7 @@ where
     /// TODO: temporarily break encapsulation for `WebTransportSession`
     pub inner: ConnectionInner<C, B>,
     pub(super) max_field_section_size: u64,
+    pub(super) max_encoded_headers_size: Option<u64>,
     // List of all incoming streams that are currently running.
     pub(super) ongoing_streams: HashSet<StreamId>,
     // Let the streams tell us when they are no longer running.
@@ -142,8 +143,9 @@ where
 
     fn create_resolver_internal(
         &self,
-        stream: FrameStream<C::BidiStream, B>,
+        mut stream: FrameStream<C::BidiStream, B>,
     ) -> RequestResolver<C, B> {
+        stream.set_max_encoded_headers_size(self.max_encoded_headers_size);
         RequestResolver {
             frame_stream: stream,
             request_end_send: self.request_end_send.clone(),
@@ -217,11 +219,13 @@ where
         }
     }
 
+    /// Drives the original HTTP3 control streams without accepting an application request.
+    ///
+    /// Returns `Pending` while healthy and completes only with a terminal connection error.
+    /// Canceling a borrowed poll retains this connection's original partial control state.
+    /// Poll one owning connection driver; concurrent drivers can replace each other's wakers.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
-    pub(crate) fn poll_control(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), ConnectionError>> {
+    pub fn poll_control(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), ConnectionError>> {
         while (self.poll_next_control(cx)?).is_ready() {}
         Poll::Pending
     }
@@ -237,7 +241,6 @@ where
             Frame::Settings(_setting) => {
                 #[cfg(feature = "tracing")]
                 trace!("Got settings > {:?}", _setting);
-                ()
             }
             &Frame::Goaway(id) => self.inner.process_goaway(&mut self.recv_closing, id)?,
             _frame @ Frame::MaxPushId(_) | _frame @ Frame::CancelPush(_) => {

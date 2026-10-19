@@ -3,7 +3,6 @@
  * https://www.rfc-editor.org/rfc/rfc9204.html#name-relative-indexing
  * https://www.rfc-editor.org/rfc/rfc9204.html#name-post-base-indexing
  */
-
 /*
  *  # Virtually infinite address space mapper.
  *
@@ -67,7 +66,6 @@
  * pst:-      pst:-   pst:-       pst:2
  * pos:-      pos:0   pos:2       pos:6
  */
-
 pub type RelativeIndex = usize;
 pub type AbsoluteIndex = usize;
 

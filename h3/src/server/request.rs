@@ -66,12 +66,13 @@ where
 {
     /// Returns a future to await the request headers and return a `Request` object
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    #[allow(clippy::type_complexity)] // Preserve the existing request/stream return contract.
     pub async fn resolve_request(
         mut self,
     ) -> Result<(Request<()>, RequestStream<C::BidiStream, B>), StreamError> {
         let frame = std::future::poll_fn(|cx| self.frame_stream.poll_next(cx)).await;
         let req = self.accept_with_frame(frame)?;
-        Ok(req.resolve().await?)
+        req.resolve().await
     }
 
     /// Accepts a http request where the first frame has already been read and decoded.
@@ -86,6 +87,13 @@ where
     ) -> Result<ResolvedRequest<C, B>, StreamError> {
         let mut encoded = match frame {
             Ok(Some(Frame::Headers(h))) => h,
+
+            Err(FrameStreamError::HeadersTooBig {
+                actual_size,
+                max_size,
+            }) => {
+                return Ok(self.into_resolved_request(Err(actual_size), max_size));
+            }
 
             //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
             //# If a client-initiated
@@ -141,6 +149,16 @@ where
             }
         };
 
+        let limit = self.max_field_section_size;
+        Ok(self.into_resolved_request(decoded, limit))
+    }
+
+    /// Reuses the original response and stream owner for encoded and decoded budget refusals.
+    fn into_resolved_request(
+        self,
+        decoded: Result<qpack::Decoded, u64>,
+        limit: u64,
+    ) -> ResolvedRequest<C, B> {
         let request_stream = RequestStream {
             request_end: Arc::new(RequestEnd {
                 request_end: self.request_end_send.clone(),
@@ -154,11 +172,7 @@ where
             ),
         };
 
-        Ok(ResolvedRequest::new(
-            request_stream,
-            decoded,
-            self.max_field_section_size,
-        ))
+        ResolvedRequest::new(request_stream, decoded, limit)
     }
 }
 
@@ -192,6 +206,7 @@ where
 
     /// Finishes the resolution of the request
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    #[allow(clippy::type_complexity)] // Preserve the existing request/stream return contract.
     pub async fn resolve(
         mut self,
     ) -> Result<(Request<()>, RequestStream<C::BidiStream, B>), StreamError> {

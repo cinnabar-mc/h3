@@ -24,7 +24,8 @@ pub struct FrameStream<S, B> {
     pub stream: BufRecvStream<S, B>,
     // Already read data from the stream
     decoder: FrameDecoder,
-    remaining_data: usize,
+    // Some(n) is finite DATA (zero is idle); None is an unbounded WebTransport body.
+    remaining_data: Option<usize>,
 }
 
 impl<S, B> FrameStream<S, B> {
@@ -32,8 +33,13 @@ impl<S, B> FrameStream<S, B> {
         Self {
             stream,
             decoder: FrameDecoder::default(),
-            remaining_data: 0,
+            remaining_data: Some(0),
         }
+    }
+
+    /// Installs the server's local encoded HEADERS limit before the first frame poll.
+    pub(crate) fn set_max_encoded_headers_size(&mut self, limit: Option<u64>) {
+        self.decoder.max_encoded_headers_size = limit;
     }
 
     /// Unwraps the Framed streamer and returns the underlying stream **without** data loss for
@@ -55,20 +61,27 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<Frame<PayloadLen>>, FrameStreamError>> {
         assert!(
-            self.remaining_data == 0,
+            self.remaining_data == Some(0),
             "There is still data to read, please call poll_data() until it returns None."
         );
 
         loop {
             let end = self.try_recv(cx)?;
 
-            return match self.decoder.decode(self.stream.buf_mut())? {
+            let decoded = match self.decoder.decode(self.stream.buf_mut()) {
+                Err(error @ FrameStreamError::HeadersTooBig { .. }) => {
+                    self.stream.stop_sending(Code::H3_EXCESSIVE_LOAD.into());
+                    return Poll::Ready(Err(error));
+                }
+                result => result?,
+            };
+            return match decoded {
                 Some(Frame::Data(PayloadLen(len))) => {
-                    self.remaining_data = len;
+                    self.remaining_data = Some(len);
                     Poll::Ready(Ok(Some(Frame::Data(PayloadLen(len)))))
                 }
                 frame @ Some(Frame::WebTransportStream(_)) => {
-                    self.remaining_data = usize::MAX;
+                    self.remaining_data = None;
                     Poll::Ready(Ok(frame))
                 }
                 Some(frame) => Poll::Ready(Ok(Some(frame))),
@@ -98,7 +111,7 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<impl Buf>, FrameStreamError>> {
-        if self.remaining_data == 0 {
+        if self.remaining_data == Some(0) {
             return Poll::Ready(Ok(None));
         };
 
@@ -107,19 +120,26 @@ where
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             Poll::Pending => false,
         };
-        let data = self.stream.buf_mut().take_chunk(self.remaining_data);
+        let remaining = self.remaining_data.unwrap_or(usize::MAX);
+        let data = self.stream.buf_mut().take_chunk(remaining);
 
         match (data, end) {
+            (None, true) if self.remaining_data.is_some() => {
+                Poll::Ready(Err(FrameStreamError::UnexpectedEnd))
+            }
             (None, true) => Poll::Ready(Ok(None)),
             (None, false) => Poll::Pending,
             (Some(d), true)
-                if d.remaining() < self.remaining_data
+                if self.remaining_data.is_some()
+                    && d.remaining() < remaining
                     && !self.stream.buf_mut().has_remaining() =>
             {
                 Poll::Ready(Err(FrameStreamError::UnexpectedEnd))
             }
             (Some(d), _) => {
-                self.remaining_data -= d.remaining();
+                if let Some(remaining) = &mut self.remaining_data {
+                    *remaining -= d.remaining();
+                }
                 Poll::Ready(Ok(Some(d)))
             }
         }
@@ -131,7 +151,7 @@ where
     }
 
     pub(crate) fn has_data(&self) -> bool {
-        self.remaining_data != 0
+        self.remaining_data != Some(0)
     }
 
     pub(crate) fn is_eos(&self) -> bool {
@@ -191,7 +211,7 @@ where
             FrameStream {
                 stream: send,
                 decoder: FrameDecoder::default(),
-                remaining_data: 0,
+                remaining_data: Some(0),
             },
             FrameStream {
                 stream: recv,
@@ -205,6 +225,7 @@ where
 #[derive(Default)]
 pub struct FrameDecoder {
     expected: Option<usize>,
+    max_encoded_headers_size: Option<u64>,
 }
 
 impl FrameDecoder {
@@ -227,7 +248,11 @@ impl FrameDecoder {
 
             let (pos, decoded) = {
                 let mut cur = src.cursor();
-                let decoded = Frame::decode(&mut cur);
+                let decoded = if self.max_encoded_headers_size.is_some() {
+                    Frame::decode_with_max_headers(&mut cur, self.max_encoded_headers_size)
+                } else {
+                    Frame::decode(&mut cur)
+                };
                 (cur.position(), decoded)
             };
 
@@ -279,6 +304,15 @@ impl FrameDecoder {
                 Err(frame::FrameError::Malformed) => {
                     return Err(FrameStreamError::Proto(FrameProtocolError::Malformed));
                 }
+                Err(frame::FrameError::HeadersTooBig {
+                    actual_size,
+                    max_size,
+                }) => {
+                    return Err(FrameStreamError::HeadersTooBig {
+                        actual_size,
+                        max_size,
+                    });
+                }
             }
         }
     }
@@ -290,6 +324,11 @@ pub enum FrameStreamError {
     Proto(FrameProtocolError),
     Quic(StreamErrorIncoming),
     UnexpectedEnd,
+    /// An encoded HEADERS length exceeded the selected local limit before its body was read.
+    HeadersTooBig {
+        actual_size: u64,
+        max_size: u64,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -315,6 +354,90 @@ mod tests {
     use crate::proto::{coding::Encode, frame::FrameType, varint::VarInt};
 
     // Decoder
+
+    #[test]
+    fn encoded_headers_reject_fragmented_length_before_payload() {
+        let limit = 4096;
+        let mut wire = BytesMut::new();
+        FrameType::HEADERS.encode(&mut wire);
+        VarInt::from_u64(limit + 1).unwrap().encode(&mut wire);
+        let mut input = BufList::from(wire.split_to(2));
+        let mut decoder = FrameDecoder {
+            max_encoded_headers_size: Some(limit),
+            ..Default::default()
+        };
+        assert_matches!(decoder.decode(&mut input), Ok(None));
+        input.push(wire);
+        assert_matches!(
+            decoder.decode(&mut input),
+            Err(FrameStreamError::HeadersTooBig { actual_size, max_size })
+                if actual_size == limit + 1 && max_size == limit
+        );
+    }
+
+    #[test]
+    fn encoded_headers_default_and_exact_boundary_preserve_payload() {
+        let payload = Bytes::from_static(b"original");
+        for limit in [None, Some(payload.len() as u64)] {
+            let mut wire = BytesMut::new();
+            Frame::<Bytes>::Headers(payload.clone()).encode_with_payload(&mut wire);
+            let mut input = BufList::from(wire);
+            let mut decoder = FrameDecoder {
+                max_encoded_headers_size: limit,
+                ..Default::default()
+            };
+            assert_matches!(
+                decoder.decode(&mut input),
+                Ok(Some(Frame::Headers(decoded))) if decoded == payload
+            );
+        }
+    }
+
+    #[test]
+    fn encoded_headers_limit_does_not_limit_data_or_webtransport() {
+        let mut data = BytesMut::new();
+        FrameType::DATA.encode(&mut data);
+        VarInt::from(8192u32).encode(&mut data);
+        let mut decoder = FrameDecoder {
+            max_encoded_headers_size: Some(0),
+            ..Default::default()
+        };
+        assert_matches!(
+            decoder.decode(&mut BufList::from(data)),
+            Ok(Some(Frame::Data(PayloadLen(8192))))
+        );
+        let session = crate::webtransport::SessionId::try_from(0).unwrap();
+        let mut stream = BytesMut::new();
+        Frame::<Bytes>::WebTransportStream(session).encode_with_payload(&mut stream);
+        assert_matches!(
+            decoder.decode(&mut BufList::from(stream)),
+            Ok(Some(Frame::WebTransportStream(id))) if id == session
+        );
+    }
+
+    #[test]
+    fn encoded_headers_decoded_field_budget_remains_independent() {
+        let field = crate::qpack::HeaderField::from((":method", "GET"));
+        let decoded_size = field.mem_size() as u64;
+        let mut encoded = BytesMut::new();
+        crate::qpack::encode_stateless(&mut encoded, vec![field]).unwrap();
+        let limit = encoded.len() as u64;
+        let mut wire = BytesMut::new();
+        Frame::<Bytes>::Headers(encoded.freeze()).encode_with_payload(&mut wire);
+        let mut decoder = FrameDecoder {
+            max_encoded_headers_size: Some(limit),
+            ..Default::default()
+        };
+        let mut decoded = match decoder.decode(&mut BufList::from(wire)).unwrap() {
+            Some(Frame::Headers(encoded)) => encoded,
+            _ => panic!("actual original HEADERS frame"),
+        };
+        assert_matches!(
+            crate::qpack::decode_stateless(&mut decoded.clone(), decoded_size - 1),
+            Err(crate::qpack::DecoderError::HeaderTooLong(size)) if size == decoded_size
+        );
+        assert!(crate::qpack::decode_stateless(&mut decoded, decoded_size).is_ok());
+    }
 
     #[test]
     fn one_frame() {
@@ -578,6 +701,71 @@ mod tests {
             |cx| to_bytes(stream.poll_data(cx)),
             Ok(Some(b)) if &*b == b"dy"
         );
+    }
+
+    #[tokio::test]
+    async fn body_end_finite_data_requires_its_declared_payload_before_fin() {
+        let mut observed = Vec::new();
+        for payload in [&b""[..], &b"bo"[..]] {
+            let mut wire = BytesMut::new();
+            FrameType::DATA.encode(&mut wire);
+            VarInt::from(4u32).encode(&mut wire);
+            wire.extend_from_slice(payload);
+            let mut recv = FakeRecv::default();
+            recv.chunk(wire.freeze());
+            let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
+            assert_poll_matches!(
+                |cx| stream.poll_next(cx),
+                Ok(Some(Frame::Data(PayloadLen(4))))
+            );
+            // Consume any delivered prefix before asking the same owner to observe actual FIN.
+            let mut terminal = poll_fn(|cx| to_bytes(stream.poll_data(cx))).await;
+            while matches!(terminal, Ok(Some(_))) {
+                terminal = poll_fn(|cx| to_bytes(stream.poll_data(cx))).await;
+            }
+            observed.push((payload.len(), terminal));
+        }
+        for (prefix, terminal) in observed {
+            assert!(
+                matches!(terminal, Err(FrameStreamError::UnexpectedEnd)),
+                "finite DATA accepted FIN after {prefix} of 4 bytes: {terminal:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn body_end_unbounded_webtransport_preserves_empty_buffered_and_split_fin() {
+        let mut observed = Vec::new();
+        for chunks in [vec![], vec![&b"body"[..]], vec![&b"bo"[..], &b"dy"[..]]] {
+            let id = crate::webtransport::SessionId::try_from(0).unwrap();
+            let mut header = BytesMut::new();
+            Frame::<Bytes>::WebTransportStream(id).encode_with_payload(&mut header);
+            let mut recv = FakeRecv::default();
+            if let Some(first) = chunks.first() {
+                header.extend_from_slice(first);
+            }
+            recv.chunk(header.freeze());
+            for chunk in chunks.into_iter().skip(1) {
+                recv.chunk(Bytes::copy_from_slice(chunk));
+            }
+            let mut stream: FrameStream<_, ()> = FrameStream::new(BufRecvStream::new(recv));
+            assert_poll_matches!(
+                |cx| stream.poll_next(cx),
+                Ok(Some(Frame::WebTransportStream(actual))) if actual == id
+            );
+            let mut body = BytesMut::new();
+            let terminal = loop {
+                match poll_fn(|cx| to_bytes(stream.poll_data(cx))).await {
+                    Ok(Some(bytes)) => body.extend_from_slice(&bytes),
+                    terminal => break terminal,
+                }
+            };
+            observed.push((body.freeze(), terminal));
+        }
+        for ((body, terminal), expected) in observed.into_iter().zip([&b""[..], b"body", b"body"]) {
+            assert_matches!(terminal, Ok(None));
+            assert_eq!(body.as_ref(), expected);
+        }
     }
 
     // Helpers

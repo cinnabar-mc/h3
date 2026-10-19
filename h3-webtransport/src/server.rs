@@ -6,8 +6,11 @@ use std::{
     task::{Context, Poll},
 };
 
-use bytes::Buf;
-use futures_util::{future::poll_fn, ready, Future};
+use bytes::{Buf, Bytes};
+use futures_util::{
+    future::{poll_fn, Shared},
+    ready, Future, FutureExt,
+};
 use h3::{
     error::{
         connection_error_creators::CloseStream, internal_error::InternalConnectionError, Code,
@@ -34,6 +37,12 @@ use h3::webtransport::SessionId;
 use pin_project_lite::pin_project;
 
 use crate::stream::{BidiStream, RecvStream, SendStream};
+use crate::{capsule::encode_close, SessionClose};
+
+mod control;
+use control::{ConnectClose, ConnectControl};
+mod wake;
+use wake::{DriverWake, Role, Waiter};
 
 /// WebTransport session driver.
 ///
@@ -50,12 +59,45 @@ where
     session_id: SessionId,
     /// The underlying HTTP/3 connection
     server_conn: Mutex<Connection<C, B>>,
-    connect_stream: RequestStream<C::BidiStream, B>,
+    driver_wake: Arc<DriverWake>,
+    connect_control: Arc<Mutex<ConnectControl<C::BidiStream, B>>>,
+    // Only the private closed wrapper has no observer; it exposes maintenance alone.
+    session_close: Option<Shared<ConnectClose<C::BidiStream, B>>>,
     opener: Mutex<C::OpenStreams>,
     /// Shared State
     ///
     /// Shared state is already in server_conn, but with this it is not necessary to lock the mutex
     shared: Arc<SharedState>,
+}
+
+/// Retains the original HTTP3 owner after local session-close DATA and FIN were accepted.
+///
+/// It has no application stream admission API. Drive its control work while the caller's
+/// original finite physical-close policy retires QUIC. Dropping it closes the connection;
+/// merely retaining a cloned QUIC handle does not postpone that close.
+pub struct ClosedWebTransportSession<C, B>
+where
+    C: quic::Connection<B> + quic_traits::DatagramConnectionExt<B>,
+    Connection<C, B>: HandleDatagramsExt<C, B>,
+    B: Buf,
+{
+    session: WebTransportSession<C, B>,
+}
+
+impl<C, B> ClosedWebTransportSession<C, B>
+where
+    C: quic::Connection<B> + quic_traits::DatagramConnectionExt<B>,
+    Connection<C, B>: HandleDatagramsExt<C, B>,
+    B: Buf,
+{
+    /// Drives the same original HTTP3 control owner through bounded physical retirement.
+    ///
+    /// Remains pending while healthy; the first connection failure completes the wait.
+    /// Canceling this borrowed wait retains partial control state. Poll only one maintenance
+    /// driver beside the caller's physical-close observation and original absolute cutoff.
+    pub async fn maintain(&self) -> Result<(), ConnectionError> {
+        self.session.maintain().await
+    }
 }
 
 impl<C, B> ConnectionState for WebTransportSession<C, B>
@@ -145,12 +187,16 @@ where
         let session_id = stream.send_id().into();
         let conn_inner = &mut conn.inner.conn;
         let opener = Mutex::new(conn_inner.opener());
+        let connect_control = Arc::new(Mutex::new(ConnectControl::new(stream)));
+        let session_close = ConnectClose::new(Arc::clone(&connect_control)).shared();
 
         Ok(Self {
             session_id,
             opener,
             server_conn: Mutex::new(conn),
-            connect_stream: stream,
+            driver_wake: Arc::default(),
+            connect_control,
+            session_close: Some(session_close),
             shared,
         })
     }
@@ -167,23 +213,117 @@ where
         self.server_conn
             .lock()
             .unwrap()
-            .get_datagram_sender(self.connect_stream.send_id())
+            .get_datagram_sender(self.connect_control.lock().unwrap().stream.send_id())
+    }
+
+    /// Observes the original CONNECT close capsule, clean EOF, or first stream/protocol failure.
+    ///
+    /// Dropping this borrowed wait retains partial input and the exact terminal for later calls.
+    /// Concurrent observers share one physical reader and each wakes when its terminal completes.
+    /// The caller remains responsible for retiring its already derived application streams.
+    pub async fn recv_session_close(&self) -> Result<Option<SessionClose>, Arc<StreamError>> {
+        self.session_close
+            .as_ref()
+            .expect("a live session owns its CONNECT close observation")
+            .clone()
+            .await
+    }
+
+    /// Drives the original HTTP3 control streams even when application accept slots are full.
+    ///
+    /// Healthy progress stays pending; only a terminal connection failure completes this wait.
+    /// A canceled borrowed wait retains partial input. Poll one maintenance driver, not
+    /// competing maintenance waits; this neither accepts requests nor starts another reader.
+    /// It may run beside one pending uni accept and one pending bidi accept.
+    pub async fn maintain(&self) -> Result<(), ConnectionError> {
+        let waiter = self.driver_wake.waiter(Role::Maintenance);
+        poll_fn(|cx| waiter.poll(cx, |cx| self.server_conn.lock().unwrap().poll_control(cx))).await
+    }
+
+    /// Sends one bounded close capsule and finishes the original CONNECT response direction.
+    ///
+    /// Retain this consuming future under the caller's existing finite retirement budget.
+    /// Dropping it is abortive; completion reports local write/FIN, not remote receipt.
+    /// A previously observed peer terminal causes no additional close capsule.
+    /// The returned owner keeps HTTP3 alive until the caller deliberately retires physical QUIC.
+    /// The caller must first retire its derived application streams and retain the returned
+    /// owner while driving control and physical-close work under the same original cutoff.
+    pub async fn close(
+        self,
+        code: u32,
+        reason: &str,
+    ) -> Result<ClosedWebTransportSession<C, B>, StreamError>
+    where
+        B: From<Bytes>,
+    {
+        let Self {
+            session_id,
+            server_conn,
+            driver_wake,
+            mut connect_control,
+            session_close,
+            opener,
+            shared,
+        } = self;
+        // Borrowed observers have ended; dropping the base releases its physical reader.
+        drop(session_close);
+        let control = Arc::get_mut(&mut connect_control)
+            .ok_or_else(|| {
+                let mut handler = WTransportStreamHandler {
+                    shared: Arc::clone(&shared),
+                };
+                handler.handle_connection_error_on_stream(InternalConnectionError::new(
+                    Code::H3_INTERNAL_ERROR,
+                    "CONNECT close observer retained after session consumption".to_string(),
+                ))
+            })?
+            .get_mut()
+            .unwrap();
+        if !control.terminal_observed() {
+            control
+                .stream
+                .send_data(B::from(encode_close(code, reason)))
+                .await?;
+        }
+        control.stream.stop_sending(Code::H3_NO_ERROR);
+        control.stream.finish().await?;
+        Ok(ClosedWebTransportSession {
+            session: Self {
+                session_id,
+                server_conn,
+                driver_wake,
+                connect_control,
+                session_close: None,
+                opener,
+                shared,
+            },
+        })
     }
 
     /// Accept an incoming unidirectional stream from the client, it reads the stream until EOF.
-    pub fn accept_uni(&self) -> AcceptUni<C, B> {
+    ///
+    /// Poll only one pending uni accept. Maintenance and one bidi accept may run concurrently.
+    pub fn accept_uni(&self) -> AcceptUni<'_, C, B> {
         AcceptUni {
             conn: &self.server_conn,
+            waiter: self.driver_wake.waiter(Role::Uni),
         }
     }
 
     /// Accepts an incoming bidirectional stream or request
+    ///
+    /// Poll only one pending bidi accept. Maintenance and one uni accept may run concurrently.
     pub async fn accept_bi(&self) -> Result<Option<AcceptedBi<C, B>>, StreamError> {
-        let stream = poll_fn(|cx| {
-            let mut conn = self.server_conn.lock().unwrap();
-            conn.poll_accept_request_stream(cx)
-        })
-        .await;
+        let stream = {
+            let waiter = self.driver_wake.waiter(Role::Bi);
+            poll_fn(|cx| {
+                waiter.poll(cx, |cx| {
+                    let mut conn = self.server_conn.lock().unwrap();
+                    conn.poll_accept_request_stream(cx)
+                })
+            })
+            .await
+        };
 
         let stream = match stream {
             Ok(Some(s)) => FrameStream::new(BufRecvStream::new(s)),
@@ -219,7 +359,7 @@ where
     }
 
     /// Open a new bidirectional stream
-    pub fn open_bi(&self, session_id: SessionId) -> OpenBi<C, B> {
+    pub fn open_bi(&self, session_id: SessionId) -> OpenBi<'_, C, B> {
         OpenBi {
             opener: &self.opener,
             stream: None,
@@ -231,7 +371,7 @@ where
     }
 
     /// Open a new unidirectional stream
-    pub fn open_uni(&self, session_id: SessionId) -> OpenUni<C, B> {
+    pub fn open_uni(&self, session_id: SessionId) -> OpenUni<'_, C, B> {
         OpenUni {
             opener: &self.opener,
             stream: None,
@@ -262,11 +402,23 @@ type PendingUniStreams<C, B> = (
 
 pin_project! {
     /// Future for opening a bidi stream
+    ///
+    /// Dropping a retained partial prefix resets its send side and stops its receive side. A completed
+    /// future has transferred its stream and leaves that returned owner untouched.
     pub struct OpenBi<'a, C:quic::Connection<B>, B:Buf> {
         opener: &'a Mutex<C::OpenStreams>,
         stream: Option<PendingStreams<C,B>>,
         session_id: SessionId,
         stream_handler: WTransportStreamHandler,
+    }
+
+    impl<C: quic::Connection<B>, B: Buf> PinnedDrop for OpenBi<'_, C, B> {
+        fn drop(this: Pin<&mut Self>) {
+            if let Some((stream, _)) = this.project().stream {
+                quic::SendStream::reset(stream, Code::H3_REQUEST_CANCELLED.value());
+                quic::RecvStream::stop_sending(stream, Code::H3_REQUEST_CANCELLED.value());
+            }
+        }
     }
 }
 
@@ -282,7 +434,7 @@ impl ConnectionState for WTransportStreamHandler {
 
 impl CloseStream for WTransportStreamHandler {}
 
-impl<'a, B, C> Future for OpenBi<'a, C, B>
+impl<B, C> Future for OpenBi<'_, C, B>
 where
     C: quic::Connection<B>,
     B: Buf,
@@ -304,7 +456,7 @@ where
                     return Poll::Ready(Ok(stream));
                 }
                 None => {
-                    let mut opener = (*p.opener).lock().unwrap();
+                    let mut opener = p.opener.lock().unwrap();
                     // Open the stream first
                     let res = ready!(opener.poll_open_bidi(cx))
                         .map_err(|err| p.stream_handler.handle_quic_stream_error(err))?;
@@ -320,6 +472,9 @@ where
 
 pin_project! {
     /// Opens a unidirectional stream
+    ///
+    /// Dropping a retained partial prefix resets its original send stream. A completed
+    /// future has transferred its stream and leaves that returned owner untouched.
     pub struct OpenUni<'a, C: quic::Connection<B>, B:Buf> {
         opener: &'a Mutex<C::OpenStreams>,
         stream: Option<PendingUniStreams<C, B>>,
@@ -327,9 +482,17 @@ pin_project! {
         session_id: SessionId,
         stream_handler: WTransportStreamHandler
     }
+
+    impl<C: quic::Connection<B>, B: Buf> PinnedDrop for OpenUni<'_, C, B> {
+        fn drop(this: Pin<&mut Self>) {
+            if let Some((stream, _)) = this.project().stream {
+                quic::SendStream::reset(stream, Code::H3_REQUEST_CANCELLED.value());
+            }
+        }
+    }
 }
 
-impl<'a, C, B> Future for OpenUni<'a, C, B>
+impl<C, B> Future for OpenUni<'_, C, B>
 where
     C: quic::Connection<B>,
     B: Buf,
@@ -351,7 +514,7 @@ where
                     return Poll::Ready(Ok(send));
                 }
                 None => {
-                    let mut opener = (*p.opener).lock().unwrap();
+                    let mut opener = p.opener.lock().unwrap();
                     let send = ready!(opener.poll_open_send(cx))
                         .map_err(|err| p.stream_handler.handle_quic_stream_error(err))?;
                     let send = BufRecvStream::new(send);
@@ -368,6 +531,7 @@ where
 /// An accepted incoming bidirectional stream.
 ///
 /// Since
+#[allow(clippy::large_enum_variant)] // Preserve the public inline stream variants.
 pub enum AcceptedBi<C: quic::Connection<B>, B: Buf> {
     /// An incoming bidirectional stream
     BidiStream(SessionId, BidiStream<C::BidiStream, B>),
@@ -384,9 +548,10 @@ where
     B: Buf,
 {
     conn: &'a Mutex<Connection<C, B>>,
+    waiter: Waiter<'a>,
 }
 
-impl<'a, C, B> Future for AcceptUni<'a, C, B>
+impl<C, B> Future for AcceptUni<'_, C, B>
 where
     C: quic::Connection<B>,
     B: Buf,
@@ -394,16 +559,18 @@ where
     type Output = Result<Option<(SessionId, RecvStream<C::RecvStream, B>)>, ConnectionError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut conn = self.conn.lock().unwrap();
-        conn.inner.poll_accept_recv(cx)?;
+        self.waiter.poll(cx, |cx| {
+            let mut conn = self.conn.lock().unwrap();
+            conn.inner.poll_accept_recv(cx)?;
 
-        // Get the currently available streams
-        let streams = conn.inner.accepted_streams_mut();
-        if let Some((id, stream)) = streams.wt_uni_streams.pop() {
-            return Poll::Ready(Ok(Some((id, RecvStream::new(stream)))));
-        }
+            // Get the currently available streams
+            let streams = conn.inner.accepted_streams_mut();
+            if let Some((id, stream)) = streams.wt_uni_streams.pop() {
+                return Poll::Ready(Ok(Some((id, RecvStream::new(stream)))));
+            }
 
-        Poll::Pending
+            Poll::Pending
+        })
     }
 }
 

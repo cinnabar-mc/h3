@@ -22,6 +22,7 @@ pub enum FrameError {
     UnknownFrame(u64),     // Unknown frames that should be ignored
     InvalidFrameValue,
     Incomplete(usize),
+    HeadersTooBig { actual_size: u64, max_size: u64 },
     Settings(SettingsError),
     InvalidStreamId(InvalidStreamId),
     InvalidPushId(InvalidPushId),
@@ -37,6 +38,14 @@ impl fmt::Display for FrameError {
             FrameError::UnknownFrame(c) => write!(f, "frame 0x{:x} ignored", c),
             FrameError::InvalidFrameValue => write!(f, "frame value is invalid"),
             FrameError::Incomplete(x) => write!(f, "internal error: frame incomplete {}", x),
+            FrameError::HeadersTooBig {
+                actual_size,
+                max_size,
+            } => write!(
+                f,
+                "encoded headers size {} exceeds limit {}",
+                actual_size, max_size
+            ),
             FrameError::Settings(x) => write!(f, "invalid settings: {}", x),
             FrameError::InvalidStreamId(x) => write!(f, "{}", x),
             FrameError::InvalidPushId(x) => write!(f, "{}", x),
@@ -80,6 +89,14 @@ impl Frame<PayloadLen> {
 
     /// Decodes a Frame from the stream according to <https://www.rfc-editor.org/rfc/rfc9114#section-7.1>
     pub fn decode<T: Buf>(buf: &mut T) -> Result<Self, FrameError> {
+        Self::decode_with_max_headers(buf, None)
+    }
+
+    /// Applies only the selected local HEADERS limit at the original length decoder.
+    pub(crate) fn decode_with_max_headers<T: Buf>(
+        buf: &mut T,
+        max_encoded_headers_size: Option<u64>,
+    ) -> Result<Self, FrameError> {
         let remaining = buf.remaining();
         let ty = FrameType::decode(buf).map_err(|_| FrameError::Incomplete(remaining + 1))?;
 
@@ -96,6 +113,15 @@ impl Frame<PayloadLen> {
         let len = buf
             .get_var()
             .map_err(|_| FrameError::Incomplete(remaining + 1))?;
+
+        if let Some(max_size) =
+            max_encoded_headers_size.filter(|max| ty == FrameType::HEADERS && len > *max)
+        {
+            return Err(FrameError::HeadersTooBig {
+                actual_size: len,
+                max_size,
+            });
+        }
 
         if ty == FrameType::DATA {
             return Ok(Frame::Data((len as usize).into()));
