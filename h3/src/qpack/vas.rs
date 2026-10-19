@@ -3,7 +3,6 @@
  * https://www.rfc-editor.org/rfc/rfc9204.html#name-relative-indexing
  * https://www.rfc-editor.org/rfc/rfc9204.html#name-post-base-indexing
  */
-
 /*
  *  # Virtually infinite address space mapper.
  *
