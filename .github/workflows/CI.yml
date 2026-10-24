@@ -12,7 +12,7 @@ env:
   toolchain_h3_quinn_msrv: 1.71.0
   toolchain_doc: nightly-2025-04-02
   toolchain_lint: stable
-  toolchain_fuzz: nightly-2025-04-02
+  toolchain_fuzz: nightly
 
 jobs:
   ci-pass:
@@ -74,6 +74,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
+      - name: Install stable Cargo for MSRV dependency resolution
+        uses: dtolnay/rust-toolchain@stable
       - name: Install Rust ${{ env.toolchain_msrv }}
         uses: actions-rs/toolchain@v1
         with:
@@ -81,11 +83,13 @@ jobs:
           toolchain: ${{ env.toolchain_msrv }}
           override: true
       - uses: Swatinem/rust-cache@v2
+      - name: Resolve dependencies for the MSRV
+        run: bash scripts/resolve-msrv.sh
       - name: cargo check -p h3
         uses: actions-rs/cargo@v1
         with:
           command: check
-          args: -p h3
+          args: --locked -p h3
 
   msrv_h3_quinn:
     name: Check MSRV of `h3-quinn`
@@ -103,12 +107,7 @@ jobs:
           override: true
       - uses: Swatinem/rust-cache@v2
       - name: Resolve dependencies for the MSRV
-        env:
-          CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
-        run: |
-          cargo +stable update
-          cargo +stable update -p quinn --precise 0.11.7
-          cargo +stable update -p quinn-proto --precise 0.11.10
+        run: bash scripts/resolve-msrv.sh
       - name: cargo check -p h3-quinn
         uses: actions-rs/cargo@v1
         with:
